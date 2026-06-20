@@ -30,6 +30,11 @@ ALLOWED_PACKAGE_ROOT_ENTRIES = {
     "sanitized",
 }
 SAFE_DOCUMENT_TIMESTAMP = datetime(2000, 1, 1)
+SAFE_GENERATED_VALUE_PATTERN = re.compile(
+    r"SPREADSAFE_(?:EMAIL|PHONE|IBAN|PESEL|NIP|REGON|VAT_ID|VALUE|INVOICE|"
+    r"COMPANY|PERSON|SHEET)_\d{4}|"
+    r"spreadsafe_(?:file|directory)_\d{4}"
+)
 
 
 @dataclass
@@ -148,7 +153,7 @@ def _validate_xlsx(
     workbook = load_workbook(file_path, data_only=False)
     for field_name, value in _document_property_values(workbook).items():
         for detection in detector.detect_text(value):
-            if _is_safe_generated_value(detection.value):
+            if _is_safe_detection(value, detection):
                 continue
             issues.append(
                 f"{workbook_name}: document property {field_name} contains "
@@ -161,7 +166,7 @@ def _validate_xlsx(
     for property_name, value in _custom_document_property_values(workbook).items():
         property_location = _validation_location(property_name, detector)
         for detection in detector.detect_text(value):
-            if _is_safe_generated_value(detection.value):
+            if _is_safe_detection(value, detection):
                 continue
             issues.append(
                 f"{workbook_name}: custom document property {property_location} contains "
@@ -175,7 +180,7 @@ def _validate_xlsx(
             if value is not None
         )
         for detection in detector.detect_text(defined_text):
-            if _is_safe_generated_value(detection.value):
+            if _is_safe_detection(defined_text, detection):
                 continue
             issues.append(
                 f"{workbook_name}: defined name {name_location} contains "
@@ -198,7 +203,7 @@ def _validate_xlsx(
                 )
         for location, value in _worksheet_header_footer_values(worksheet).items():
             for detection in detector.detect_text(value):
-                if _is_safe_generated_value(detection.value):
+                if _is_safe_detection(value, detection):
                     continue
                 issues.append(
                     f"{workbook_name}:{worksheet_name}: {location} contains "
@@ -214,14 +219,15 @@ def _validate_xlsx(
                 )
             validation_text = _data_validation_text(validation)
             for detection in detector.detect_text(validation_text):
-                if _is_safe_generated_value(detection.value):
+                if _is_safe_detection(validation_text, detection):
                     continue
                 issues.append(
                     f"{workbook_name}:{worksheet_name}: data validation contains "
                     f"{_validation_issue_label(detection)}"
                 )
-        for detection in detector.detect_text(_auto_filter_text(worksheet)):
-            if _is_safe_generated_value(detection.value):
+        auto_filter_text = _auto_filter_text(worksheet)
+        for detection in detector.detect_text(auto_filter_text):
+            if _is_safe_detection(auto_filter_text, detection):
                 continue
             issues.append(
                 f"{workbook_name}:{worksheet_name}: auto filter contains "
@@ -246,7 +252,7 @@ def _validate_xlsx(
                         continue
                     if value is not None:
                         for detection in detector.detect_text(str(value)):
-                            if _is_safe_generated_value(detection.value):
+                            if _is_safe_detection(str(value), detection):
                                 continue
                             issues.append(
                                 f"{workbook_name}:{worksheet_name}:{cell.coordinate}: "
@@ -264,7 +270,7 @@ def _validate_xlsx(
                     )
                     continue
                 for detection in detector.detect_text(value):
-                    if _is_safe_generated_value(detection.value):
+                    if _is_safe_detection(value, detection):
                         continue
                     issues.append(
                         f"{workbook_name}:{worksheet_name}:{cell.coordinate}: "
@@ -276,7 +282,7 @@ def _validate_text_file(file_path: Path, detector: Detector, issues: list[str]) 
     file_name = _validation_location(file_path.name, detector)
     text = file_path.read_text(encoding="utf-8", errors="ignore")
     for detection in detector.detect_text(text):
-        if _is_safe_generated_value(detection.value):
+        if _is_safe_detection(text, detection):
             continue
         issues.append(f"{file_name}: {_validation_issue_label(detection)} remains")
 
@@ -356,7 +362,7 @@ def _validate_csv_values(file_path: Path, detector: Detector, issues: list[str])
             detections = detector.detect_text(value)
             if detections:
                 for detection in detections:
-                    if _is_safe_generated_value(detection.value):
+                    if _is_safe_detection(value, detection):
                         continue
                     issues.append(
                         f"{file_name}: row {row_index} column {column_index} "
@@ -407,13 +413,15 @@ def _value_violates_config_sensitive(detector: Detector, header: str, value: Any
 
 
 def _is_safe_generated_value(value: str) -> bool:
-    return bool(
-        re.fullmatch(
-            r"SPREADSAFE_(?:EMAIL|PHONE|IBAN|PESEL|NIP|REGON|VAT_ID|VALUE|INVOICE|"
-            r"COMPANY|PERSON|SHEET)_\d{4}|"
-            r"spreadsafe_(?:file|directory)_\d{4}",
-            value,
-        )
+    return bool(SAFE_GENERATED_VALUE_PATTERN.fullmatch(value))
+
+
+def _is_safe_detection(value: str, detection: Detection) -> bool:
+    if _is_safe_generated_value(detection.value):
+        return True
+    return any(
+        match.start() <= detection.start and detection.end <= match.end()
+        for match in SAFE_GENERATED_VALUE_PATTERN.finditer(value)
     )
 
 
@@ -427,7 +435,7 @@ def _validation_location(value: str, detector: Detector) -> str:
     detections = [
         detection
         for detection in detector.detect_path(value)
-        if not _is_safe_generated_value(detection.value)
+        if not _is_safe_detection(value, detection)
     ]
     if not detections:
         return value

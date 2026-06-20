@@ -2536,6 +2536,23 @@ def test_validator_recognizes_generated_tokens_as_safe() -> None:
     assert not _is_safe_generated_value("jan@example.com")
 
 
+def test_validate_ignores_presidio_hits_inside_generated_tokens(tmp_path: Path) -> None:
+    input_dir = tmp_path / "input"
+    output_dir = tmp_path / "codex-safe"
+    input_dir.mkdir()
+    workbook = Workbook()
+    worksheet = workbook.active
+    worksheet.append(["Status"])
+    worksheet.append(["SPREADSAFE_REGON_0001"])
+    worksheet.append(["SPREADSAFE_VALUE_0001"])
+    workbook.save(input_dir / "tokens.xlsx")
+
+    result = package_directory(input_dir, output_dir)
+
+    assert result.passed
+    assert validate_output(output_dir).passed
+
+
 def test_scan_command_applies_sensitive_column_config_to_reports(tmp_path: Path) -> None:
     input_dir = tmp_path / "input"
     output_dir = tmp_path / "reports"
