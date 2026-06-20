@@ -9,11 +9,9 @@ description = "Local spreadsheet sanitizer for Codex-safe Excel and CSV handoff 
 readme = "README.md"
 requires-python = ">=3.11,<3.14"
 dependencies = [
-  "click>=8.4.1",
   "openpyxl>=3.1",
   "presidio-analyzer>=2.2",
   "pyyaml>=6",
-  "typer>=0.12",
 ]
 
 [dependency-groups]

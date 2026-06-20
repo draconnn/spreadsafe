@@ -1,34 +1,39 @@
 from __future__ import annotations
 
+from argparse import ArgumentParser, Namespace
 from pathlib import Path
 import shutil
+import sys
 from tempfile import TemporaryDirectory
-
-import typer
+from collections.abc import Callable, Sequence
+from typing import cast
 
 from spreadsafe.detectors import Config, Detector, load_config
 from spreadsafe.mapping import PseudonymMapper
 from spreadsafe.reporter import write_reports
 from spreadsafe.sanitizer import Sanitizer
 from spreadsafe.scanner import scan_directory
-from spreadsafe.validators import ValidationResult, _is_safe_generated_value, validate_output
+from spreadsafe.validators import (
+    ALLOWED_PACKAGE_ROOT_ENTRIES,
+    ValidationResult,
+    _is_safe_generated_value,
+    validate_output,
+)
 
-app = typer.Typer(help="Create Codex-safe sanitized spreadsheet packages.")
 
-
-@app.command()
-def scan(input_dir: Path, out: Path = typer.Option(..., "--out")) -> None:
+def scan(input_dir: Path, out: Path) -> int:
     try:
         result = package_directory(input_dir, out)
     except ValueError as exc:
-        typer.echo(f"error: {exc}", err=True)
-        raise typer.Exit(2) from exc
-    _exit_if_validation_failed(result)
-    typer.echo(f"Wrote reports to {out / 'reports'}")
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    if _exit_if_validation_failed(result):
+        return 1
+    print(f"Wrote reports to {out / 'reports'}")
+    return 0
 
 
-@app.command()
-def sanitize(input_dir: Path, out: Path = typer.Option(..., "--out")) -> None:
+def sanitize(input_dir: Path, out: Path) -> int:
     try:
         _ensure_input_directory(input_dir)
         config = load_config(input_dir / "spreadsafe.yml")
@@ -45,38 +50,37 @@ def sanitize(input_dir: Path, out: Path = typer.Option(..., "--out")) -> None:
             if result.passed:
                 _replace_generated_output(staged_out, out, ("sanitized", "reports", ".spreadsafe-package"))
     except ValueError as exc:
-        typer.echo(f"error: {exc}", err=True)
-        raise typer.Exit(2) from exc
-    _exit_if_validation_failed(result)
-    typer.echo(f"Wrote sanitized files to {out / 'sanitized'}")
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    if _exit_if_validation_failed(result):
+        return 1
+    print(f"Wrote sanitized files to {out / 'sanitized'}")
+    return 0
 
 
-@app.command()
-def validate(out: Path, config: Path | None = typer.Option(None, "--config")) -> None:
+def validate(out: Path, config: Path | None = None) -> int:
     try:
         loaded_config = load_config(config)
         result = validate_output(out, loaded_config)
     except ValueError as exc:
-        typer.echo(f"error: {exc}", err=True)
-        raise typer.Exit(2) from exc
-    for warning in result.warnings:
-        typer.echo(f"warning: {warning}", err=True)
-    if not result.passed:
-        for issue in result.issues:
-            typer.echo(f"error: {issue}", err=True)
-        raise typer.Exit(1)
-    typer.echo("Validation passed")
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    if _exit_if_validation_failed(result):
+        return 1
+    print("Validation passed")
+    return 0
 
 
-@app.command(name="package")
-def package_command(input_dir: Path, out: Path = typer.Option(..., "--out")) -> None:
+def package_command(input_dir: Path, out: Path) -> int:
     try:
         result = package_directory(input_dir, out)
     except ValueError as exc:
-        typer.echo(f"error: {exc}", err=True)
-        raise typer.Exit(2) from exc
-    _exit_if_validation_failed(result)
-    typer.echo(f"Wrote Codex-safe package to {out}")
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    if _exit_if_validation_failed(result):
+        return 1
+    print(f"Wrote Codex-safe package to {out}")
+    return 0
 
 
 def package_directory(input_dir: Path, output_dir: Path) -> ValidationResult:
@@ -110,13 +114,14 @@ def package_directory(input_dir: Path, output_dir: Path) -> ValidationResult:
         return result
 
 
-def _exit_if_validation_failed(result: ValidationResult) -> None:
+def _exit_if_validation_failed(result: ValidationResult) -> bool:
     for warning in result.warnings:
-        typer.echo(f"warning: {warning}", err=True)
+        print(f"warning: {warning}", file=sys.stderr)
     if not result.passed:
         for issue in result.issues:
-            typer.echo(f"error: {issue}", err=True)
-        raise typer.Exit(1)
+            print(f"error: {issue}", file=sys.stderr)
+        return True
+    return False
 
 
 def _ensure_input_directory(input_dir: Path) -> None:
@@ -143,12 +148,14 @@ def _replace_generated_output(
     output_dir: Path,
     child_names: tuple[str, ...],
 ) -> None:
+    _ensure_output_is_owned_or_empty(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     backups: list[tuple[Path, Path]] = []
     installed: list[Path] = []
     try:
         for child_name in child_names:
             child = output_dir / child_name
+            _ensure_managed_output_child_is_safe(child)
             if child.exists():
                 backup = _backup_path(child)
                 _replace_path(child, backup)
@@ -157,6 +164,7 @@ def _replace_generated_output(
             child = staged_output / child_name
             if child.exists():
                 destination = output_dir / child_name
+                _ensure_managed_output_child_is_safe(destination)
                 _replace_path(child, destination)
                 installed.append(destination)
     except Exception:
@@ -191,6 +199,20 @@ def _replace_path(source: Path, destination: Path) -> None:
     shutil.move(str(source), destination)
 
 
+def _ensure_managed_output_child_is_safe(path: Path) -> None:
+    if path.is_symlink():
+        raise ValueError(f"Cannot replace managed output path because {path} is a symlink")
+    if not path.exists():
+        return
+    if path.name in {"sanitized", "reports"} and not path.is_dir():
+        raise ValueError(f"Cannot replace managed output path because {path} is not a directory")
+    if path.name == ".spreadsafe-package":
+        if not path.is_file():
+            raise ValueError("Existing output package marker is not a file")
+        if path.read_text(encoding="utf-8", errors="ignore") != "spreadsafe\n":
+            raise ValueError("Existing output package marker content is invalid")
+
+
 def _ensure_output_is_owned_or_empty(output_dir: Path, config: Config | None = None) -> None:
     if not output_dir.exists():
         return
@@ -199,9 +221,15 @@ def _ensure_output_is_owned_or_empty(output_dir: Path, config: Config | None = N
     if not output_dir.is_dir():
         raise ValueError(f"Cannot use output path because {output_dir} is not a directory")
     marker = output_dir / ".spreadsafe-package"
-    allowed_root_entries = {".gitignore", ".spreadsafe-package", "reports", "sanitized"}
+    if marker.is_symlink():
+        raise ValueError(f"Cannot use output directory because {marker} is a symlink")
+    if marker.exists():
+        if not marker.is_file():
+            raise ValueError("Existing output package marker is not a file")
+        if marker.read_text(encoding="utf-8", errors="ignore") != "spreadsafe\n":
+            raise ValueError("Existing output package marker content is invalid")
     for child in output_dir.iterdir():
-        if child.name not in allowed_root_entries:
+        if child.name not in ALLOWED_PACKAGE_ROOT_ENTRIES:
             raise ValueError(f"Refusing to use existing output directory containing unmanaged files: {output_dir}")
         if child.name == ".gitignore":
             if child.is_symlink():
@@ -229,9 +257,38 @@ def _ensure_output_is_owned_or_empty(output_dir: Path, config: Config | None = N
             )
 
 
-def main() -> None:
-    app()
+def _build_parser() -> ArgumentParser:
+    parser = ArgumentParser(description="Create Codex-safe sanitized spreadsheet packages.")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    for name in ("scan", "sanitize", "package"):
+        command = subparsers.add_parser(name)
+        command.add_argument("input_dir", type=Path)
+        command.add_argument("--out", required=True, type=Path)
+        command.set_defaults(func=_run_input_output_command)
+    validate_parser = subparsers.add_parser("validate")
+    validate_parser.add_argument("out", type=Path)
+    validate_parser.add_argument("--config", type=Path)
+    validate_parser.set_defaults(func=_run_validate_command)
+    return parser
+
+
+def _run_input_output_command(args: Namespace) -> int:
+    if args.command == "scan":
+        return scan(args.input_dir, args.out)
+    if args.command == "sanitize":
+        return sanitize(args.input_dir, args.out)
+    return package_command(args.input_dir, args.out)
+
+
+def _run_validate_command(args: Namespace) -> int:
+    return validate(args.out, args.config)
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = _build_parser().parse_args(argv)
+    func = cast(Callable[[Namespace], int], args.func)
+    return func(args)
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

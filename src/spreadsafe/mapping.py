@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from decimal import Decimal
@@ -11,8 +10,8 @@ from typing import Any
 @dataclass
 class PseudonymMapper:
     seed: str = "spreadsafe"
-    mappings: dict[str, dict[str, str]] = field(default_factory=lambda: defaultdict(dict))
-    counters: dict[str, int] = field(default_factory=lambda: defaultdict(int))
+    mappings: dict[str, dict[str, str]] = field(default_factory=dict)
+    counters: dict[str, int] = field(default_factory=dict)
 
     def token(self, label: str, value: Any) -> str:
         original = str(value)
@@ -45,31 +44,28 @@ class PseudonymMapper:
             perturbed = round(numeric + (0.01 if numeric > 0 else -0.01), 2)
         return perturbed
 
-    def as_dict(self) -> dict[str, dict[str, str]]:
-        return {label: dict(values) for label, values in self.mappings.items()}
-
     def _make_token(self, label: str, index: int) -> str:
         if label == "EMAIL":
-            return f"EMAIL {index:04d}"
+            return f"SPREADSAFE_EMAIL_{index:04d}"
         if label == "PHONE":
-            return f"PHONE {index:04d}"
+            return f"SPREADSAFE_PHONE_{index:04d}"
         if label == "PERSON":
-            return f"Person {index:04d}"
+            return f"SPREADSAFE_PERSON_{index:04d}"
         if label == "COMPANY":
-            return f"Company {index:04d}"
+            return f"SPREADSAFE_COMPANY_{index:04d}"
         if label == "IBAN":
-            return f"IBAN {index:04d}"
+            return f"SPREADSAFE_IBAN_{index:04d}"
         if label in {"PESEL", "NIP", "REGON", "VAT_ID"}:
-            return f"{label} {index:04d}"
+            return f"SPREADSAFE_{label}_{index:04d}"
         if label == "INVOICE_ID":
-            return f"INV-FAKE-{index:04d}"
+            return f"SPREADSAFE_INVOICE_{index:04d}"
         if label == "FILE":
-            return f"file_{index:04d}"
+            return f"spreadsafe_file_{index:04d}"
         if label == "DIRECTORY":
-            return f"directory_{index:04d}"
+            return f"spreadsafe_directory_{index:04d}"
         if label == "SHEET":
-            return f"Sheet {index:04d}"
-        return f"{label} {index:04d}"
+            return f"SPREADSAFE_SHEET_{index:04d}"
+        return f"SPREADSAFE_{label}_{index:04d}"
 
     def _stable_int(self, key: str, minimum: int, maximum: int) -> int:
         digest = hashlib.sha256(f"{self.seed}:{key}".encode("utf-8")).hexdigest()

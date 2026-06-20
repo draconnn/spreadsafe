@@ -1,6 +1,10 @@
+from contextlib import redirect_stderr, redirect_stdout
+from dataclasses import dataclass
 from datetime import date, datetime
+from io import StringIO
 from pathlib import Path
 import json
+import shutil
 import zipfile
 
 from openpyxl.chart import BarChart, Reference
@@ -11,14 +15,31 @@ from openpyxl.worksheet.table import Table
 from openpyxl.workbook.defined_name import DefinedName
 from openpyxl.worksheet.datavalidation import DataValidation
 import pytest
-from typer.testing import CliRunner
 
 from spreadsafe import cli as cli_module
-from spreadsafe.cli import app, package_directory
+from spreadsafe.cli import main as cli_main, package_directory
 from spreadsafe.detectors import Config, load_config
 from spreadsafe.mapping import PseudonymMapper
 from spreadsafe.sanitizer import Sanitizer, _parse_decimal
 from spreadsafe.validators import ValidationResult, _is_safe_generated_value, validate_output
+
+
+@dataclass(frozen=True)
+class CliResult:
+    exit_code: int
+    stdout: str
+    stderr: str
+
+
+def invoke_cli(args: list[str]) -> CliResult:
+    stdout = StringIO()
+    stderr = StringIO()
+    try:
+        with redirect_stdout(stdout), redirect_stderr(stderr):
+            exit_code = cli_main(args)
+    except SystemExit as exc:
+        exit_code = exc.code if isinstance(exc.code, int) else 1
+    return CliResult(exit_code, stdout.getvalue(), stderr.getvalue())
 
 
 def make_workbook(path: Path) -> None:
@@ -44,7 +65,7 @@ def make_workbook(path: Path) -> None:
     workbook.save(path)
 
 
-def test_package_creates_sanitized_files_reports_and_preserves_formulas(tmp_path: Path) -> None:
+def test_package_creates_sanitized_files_reports_and_redacts_formulas(tmp_path: Path) -> None:
     input_dir = tmp_path / "input"
     output_dir = tmp_path / "codex-safe"
     input_dir.mkdir()
@@ -72,13 +93,13 @@ def test_package_creates_sanitized_files_reports_and_preserves_formulas(tmp_path
 
     workbook = load_workbook(sanitized_xlsx, data_only=False)
     row = next(workbook["Orders"].iter_rows(min_row=2, max_row=2, values_only=True))
-    assert row[1] == "Company 0002"
-    assert row[2] == "EMAIL 0001"
+    assert row[1] == "SPREADSAFE_COMPANY_0002"
+    assert row[2] == "SPREADSAFE_EMAIL_0001"
     assert row[4] == "PAID"
     assert row[5] == "[REDACTED_TEXT]"
-    assert row[6] == "=D2*1.23"
+    assert row[6] == "[REDACTED_FORMULA]"
     assert workbook["Internal"].sheet_state == "hidden"
-    assert workbook["Internal"]["A2"].value == "PESEL 0002"
+    assert workbook["Internal"]["A2"].value == "SPREADSAFE_PESEL_0002"
     for sheet in workbook.worksheets:
         for cells in sheet.iter_rows(values_only=True):
             assert "44051401359" not in {str(value) for value in cells if value is not None}
@@ -116,13 +137,20 @@ def test_validate_command_returns_failure_exit_code_for_leaks(tmp_path: Path) ->
     sanitized_dir = output_dir / "sanitized"
     sanitized_dir.mkdir(parents=True)
     (sanitized_dir / "leak.csv").write_text("email\njan@example.com\n", encoding="utf-8")
-    runner = CliRunner()
-
-    result = runner.invoke(app, ["validate", str(output_dir)])
+    result = invoke_cli(["validate", str(output_dir)])
 
     assert result.exit_code == 1
     assert "leak.csv: row 2 column 1 EMAIL remains" in result.stderr
     assert "jan@example.com" not in result.stderr
+
+
+def test_validate_function_returns_failure_code_for_leaks(tmp_path: Path) -> None:
+    output_dir = tmp_path / "codex-safe"
+    sanitized_dir = output_dir / "sanitized"
+    sanitized_dir.mkdir(parents=True)
+    (sanitized_dir / "leak.csv").write_text("email\njan@example.com\n", encoding="utf-8")
+
+    assert cli_module.validate(output_dir) == 1
 
 
 def test_validate_command_reports_success_for_clean_package(tmp_path: Path) -> None:
@@ -130,18 +158,14 @@ def test_validate_command_reports_success_for_clean_package(tmp_path: Path) -> N
     sanitized_dir = output_dir / "sanitized"
     sanitized_dir.mkdir(parents=True)
     (sanitized_dir / "safe.csv").write_text("status\nACTIVE\n", encoding="utf-8")
-    runner = CliRunner()
-
-    result = runner.invoke(app, ["validate", str(output_dir)])
+    result = invoke_cli(["validate", str(output_dir)])
 
     assert result.exit_code == 0
     assert "Validation passed" in result.stdout
 
 
 def test_cli_help_lists_commands() -> None:
-    runner = CliRunner()
-
-    result = runner.invoke(app, ["--help"])
+    result = invoke_cli(["--help"])
 
     assert result.exit_code == 0
     for command in ("scan", "sanitize", "validate", "package"):
@@ -155,9 +179,7 @@ def test_validate_command_applies_config_file(tmp_path: Path) -> None:
     config_path = tmp_path / "spreadsafe.yml"
     config_path.write_text("sensitive_columns:\n  - Internal ID\n", encoding="utf-8")
     (sanitized_dir / "internal.csv").write_text("Internal ID\ncustomer-17\n", encoding="utf-8")
-    runner = CliRunner()
-
-    result = runner.invoke(app, ["validate", str(output_dir), "--config", str(config_path)])
+    result = invoke_cli(["validate", str(output_dir), "--config", str(config_path)])
 
     assert result.exit_code == 1
     assert "configured sensitive value remains" in result.stderr
@@ -309,6 +331,44 @@ def test_package_rejects_nested_symlinked_generated_output_without_deleting_targ
     assert external_file.exists()
 
 
+def test_package_rejects_symlinked_package_marker_without_deleting_output(
+    tmp_path: Path,
+) -> None:
+    input_dir = tmp_path / "input"
+    output_dir = tmp_path / "codex-safe"
+    marker_target = tmp_path / "marker"
+    input_dir.mkdir()
+    (output_dir / "sanitized").mkdir(parents=True)
+    make_workbook(input_dir / "orders.xlsx")
+    old_file = output_dir / "sanitized" / "old.csv"
+    old_file.write_text("status\nOLD\n", encoding="utf-8")
+    marker_target.write_text("spreadsafe\n", encoding="utf-8")
+    (output_dir / ".spreadsafe-package").symlink_to(marker_target)
+
+    with pytest.raises(ValueError, match="package.*symlink|symlink"):
+        package_directory(input_dir, output_dir)
+
+    assert old_file.exists()
+
+
+def test_package_rejects_directory_package_marker_without_deleting_output(
+    tmp_path: Path,
+) -> None:
+    input_dir = tmp_path / "input"
+    output_dir = tmp_path / "codex-safe"
+    input_dir.mkdir()
+    (output_dir / "sanitized").mkdir(parents=True)
+    make_workbook(input_dir / "orders.xlsx")
+    old_file = output_dir / "sanitized" / "old.csv"
+    old_file.write_text("status\nOLD\n", encoding="utf-8")
+    (output_dir / ".spreadsafe-package").mkdir()
+
+    with pytest.raises(ValueError, match="package marker is not a file"):
+        package_directory(input_dir, output_dir)
+
+    assert old_file.exists()
+
+
 def test_package_skips_symlinked_input_files(tmp_path: Path) -> None:
     input_dir = tmp_path / "input"
     output_dir = tmp_path / "codex-safe"
@@ -365,9 +425,7 @@ def test_sanitize_command_reports_nested_output_without_traceback(tmp_path: Path
     input_dir = tmp_path / "input"
     input_dir.mkdir()
     make_workbook(input_dir / "orders.xlsx")
-    runner = CliRunner()
-
-    result = runner.invoke(app, ["sanitize", str(input_dir), "--out", str(input_dir / "out")])
+    result = invoke_cli(["sanitize", str(input_dir), "--out", str(input_dir / "out")])
 
     assert result.exit_code == 2
     assert "Output directory cannot be inside input directory" in result.stderr
@@ -391,6 +449,38 @@ def test_package_redacts_formula_when_formula_contains_sensitive_literal(tmp_pat
     assert sanitized["Orders"]["A2"].value == "[REDACTED_FORMULA]"
     report_text = (output_dir / "reports" / "workbook-report.md").read_text(encoding="utf-8")
     assert "jan@example.com" not in report_text
+
+
+def test_package_redacts_executable_xlsx_formula_payload(tmp_path: Path) -> None:
+    input_dir = tmp_path / "input"
+    output_dir = tmp_path / "codex-safe"
+    input_dir.mkdir()
+    workbook = Workbook()
+    workbook.active.append(["Status"])
+    workbook.active.append(["=cmd|' /C calc'!A0"])
+    workbook.save(input_dir / "formulas.xlsx")
+
+    result = package_directory(input_dir, output_dir)
+
+    assert result.passed
+    sanitized = load_workbook(output_dir / "sanitized" / "formulas.xlsx", data_only=False)
+    assert sanitized.active["A2"].value == "[REDACTED_FORMULA]"
+    assert validate_output(output_dir).passed
+
+
+def test_validate_rejects_executable_xlsx_formula_payload(tmp_path: Path) -> None:
+    output_dir = tmp_path / "codex-safe"
+    sanitized_dir = output_dir / "sanitized"
+    sanitized_dir.mkdir(parents=True)
+    workbook = Workbook()
+    workbook.active.append(["Status"])
+    workbook.active.append(["=cmd|' /C calc'!A0"])
+    workbook.save(sanitized_dir / "formulas.xlsx")
+
+    result = validate_output(output_dir)
+
+    assert not result.passed
+    assert any("formula remains" in issue for issue in result.issues)
 
 
 def test_package_tokenizes_formula_in_sensitive_column(tmp_path: Path) -> None:
@@ -425,7 +515,7 @@ def test_validate_rejects_formula_in_sensitive_column(tmp_path: Path) -> None:
     result = validate_output(output_dir)
 
     assert not result.passed
-    assert any("formula remains in sensitive column" in issue for issue in result.issues)
+    assert any("formula remains" in issue for issue in result.issues)
 
 
 def test_validate_rejects_formula_in_configured_sensitive_column(tmp_path: Path) -> None:
@@ -441,7 +531,7 @@ def test_validate_rejects_formula_in_configured_sensitive_column(tmp_path: Path)
     result = validate_output(output_dir, Config(sensitive_columns=["Internal ID"]))
 
     assert not result.passed
-    assert any("formula remains in sensitive column" in issue for issue in result.issues)
+    assert any("formula remains" in issue for issue in result.issues)
 
 
 def test_validate_rejects_configured_sensitive_xlsx_values(tmp_path: Path) -> None:
@@ -515,7 +605,7 @@ def test_package_redacts_prefixed_external_formula_function(tmp_path: Path) -> N
     assert validate_output(output_dir).passed
 
 
-def test_package_preserves_local_structured_reference_formulas(tmp_path: Path) -> None:
+def test_package_redacts_local_structured_reference_formulas(tmp_path: Path) -> None:
     input_dir = tmp_path / "input"
     output_dir = tmp_path / "codex-safe"
     input_dir.mkdir()
@@ -529,8 +619,8 @@ def test_package_preserves_local_structured_reference_formulas(tmp_path: Path) -
 
     assert result.passed
     sanitized = load_workbook(output_dir / "sanitized" / "structured.xlsx", data_only=False)
-    assert sanitized.active["B2"].value == "=[@Amount]*1.23"
-    assert sanitized.active["C2"].value == "=Table1[[#Totals],[Amount]]"
+    assert sanitized.active["B2"].value == "[REDACTED_FORMULA]"
+    assert sanitized.active["C2"].value == "[REDACTED_FORMULA]"
     assert validate_output(output_dir).passed
 
 
@@ -546,7 +636,7 @@ def test_validate_rejects_nested_external_formula_functions(tmp_path: Path) -> N
     result = validate_output(output_dir)
 
     assert not result.passed
-    assert any("external workbook reference" in issue for issue in result.issues)
+    assert any("formula remains" in issue for issue in result.issues)
 
 
 def test_validate_rejects_prefixed_external_formula_functions(tmp_path: Path) -> None:
@@ -561,7 +651,7 @@ def test_validate_rejects_prefixed_external_formula_functions(tmp_path: Path) ->
     result = validate_output(output_dir)
 
     assert not result.passed
-    assert any("external workbook reference" in issue for issue in result.issues)
+    assert any("formula remains" in issue for issue in result.issues)
 
 
 def test_package_redacts_external_workbook_formula_references(tmp_path: Path) -> None:
@@ -622,7 +712,7 @@ def test_validate_rejects_external_workbook_formula_references(tmp_path: Path) -
     result = validate_output(output_dir)
 
     assert not result.passed
-    assert any("external workbook reference" in issue for issue in result.issues)
+    assert any("formula remains" in issue for issue in result.issues)
 
 
 def test_package_removes_xlsx_external_link_metadata(tmp_path: Path) -> None:
@@ -679,6 +769,33 @@ def test_package_removes_unsupported_xlsx_payload_parts(tmp_path: Path) -> None:
     assert result.passed
     with zipfile.ZipFile(output_dir / "sanitized" / "media.xlsx", "r") as workbook_zip:
         assert "xl/media/image1.txt" not in set(workbook_zip.namelist())
+    assert validate_output(output_dir).passed
+
+
+def test_package_removes_macro_and_activex_xlsx_payload_parts(tmp_path: Path) -> None:
+    input_dir = tmp_path / "input"
+    output_dir = tmp_path / "codex-safe"
+    input_dir.mkdir()
+    workbook = Workbook()
+    workbook.active.append(["Status"])
+    workbook.active.append(["ACTIVE"])
+    workbook.save(input_dir / "macro.xlsx")
+    _add_macro_and_activex_parts(input_dir / "macro.xlsx")
+
+    result = package_directory(input_dir, output_dir)
+
+    assert result.passed
+    with zipfile.ZipFile(output_dir / "sanitized" / "macro.xlsx", "r") as workbook_zip:
+        names = set(workbook_zip.namelist())
+        assert "xl/vbaProject.bin" not in names
+        assert "xl/activeX/activeX1.bin" not in names
+        assert "xl/ctrlProps/ctrlProp1.xml" not in names
+        assert b"vbaProject" not in workbook_zip.read("xl/_rels/workbook.xml.rels")
+        content_types = workbook_zip.read("[Content_Types].xml")
+        assert b"vbaProject" not in content_types
+        assert b"activeX" not in content_types
+        if "xl/worksheets/_rels/sheet1.xml.rels" in names:
+            assert b"activeX" not in workbook_zip.read("xl/worksheets/_rels/sheet1.xml.rels")
     assert validate_output(output_dir).passed
 
 
@@ -752,6 +869,22 @@ def test_validate_rejects_unsupported_xlsx_payload_parts(tmp_path: Path) -> None
     assert any("unsupported workbook payload remains" in issue for issue in result.issues)
 
 
+def test_validate_rejects_macro_and_activex_xlsx_payload_parts(tmp_path: Path) -> None:
+    output_dir = tmp_path / "codex-safe"
+    sanitized_dir = output_dir / "sanitized"
+    sanitized_dir.mkdir(parents=True)
+    workbook = Workbook()
+    workbook.active.append(["Status"])
+    workbook.active.append(["ACTIVE"])
+    workbook.save(sanitized_dir / "macro.xlsx")
+    _add_macro_and_activex_parts(sanitized_dir / "macro.xlsx")
+
+    result = validate_output(output_dir)
+
+    assert not result.passed
+    assert any("unsupported workbook payload remains" in issue for issue in result.issues)
+
+
 def test_validate_rejects_xlsx_table_metadata_parts(tmp_path: Path) -> None:
     output_dir = tmp_path / "codex-safe"
     sanitized_dir = output_dir / "sanitized"
@@ -803,7 +936,7 @@ def test_validate_rejects_path_qualified_external_workbook_formula_references(
     result = validate_output(output_dir)
 
     assert not result.passed
-    assert any("external workbook reference" in issue for issue in result.issues)
+    assert any("formula remains" in issue for issue in result.issues)
 
 
 def test_validate_rejects_sensitive_csv_headers(tmp_path: Path) -> None:
@@ -858,10 +991,9 @@ def test_validate_rejects_identifier_shaped_amounts(tmp_path: Path) -> None:
 
 
 def test_sanitize_command_rejects_missing_input_directory(tmp_path: Path) -> None:
-    runner = CliRunner()
     missing_input = tmp_path / "missing"
 
-    result = runner.invoke(app, ["sanitize", str(missing_input), "--out", str(tmp_path / "out")])
+    result = invoke_cli(["sanitize", str(missing_input), "--out", str(tmp_path / "out")])
 
     assert result.exit_code == 2
     assert "Input directory does not exist" in result.stderr
@@ -873,9 +1005,7 @@ def test_sanitize_command_creates_output_for_unsupported_only_input(tmp_path: Pa
     output_dir = tmp_path / "codex-safe"
     input_dir.mkdir()
     (input_dir / "legacy.xls").write_bytes(b"unsupported")
-    runner = CliRunner()
-
-    result = runner.invoke(app, ["sanitize", str(input_dir), "--out", str(output_dir)])
+    result = invoke_cli(["sanitize", str(input_dir), "--out", str(output_dir)])
 
     assert result.exit_code == 0
     assert (output_dir / ".spreadsafe-package").read_text(encoding="utf-8") == "spreadsafe\n"
@@ -892,9 +1022,7 @@ def test_sanitize_command_clears_stale_sanitized_files(tmp_path: Path) -> None:
     stale_file = stale_sanitized / "old.csv"
     stale_file.write_text("email\njan@example.com\n", encoding="utf-8")
     (output_dir / ".spreadsafe-package").write_text("spreadsafe\n", encoding="utf-8")
-    runner = CliRunner()
-
-    result = runner.invoke(app, ["sanitize", str(input_dir), "--out", str(output_dir)])
+    result = invoke_cli(["sanitize", str(input_dir), "--out", str(output_dir)])
 
     assert result.exit_code == 0
     assert not stale_file.exists()
@@ -909,14 +1037,12 @@ def test_sanitize_command_exits_on_validation_failure(
     output_dir = tmp_path / "codex-safe"
     input_dir.mkdir()
     (input_dir / "safe.csv").write_text("status\nACTIVE\n", encoding="utf-8")
-    runner = CliRunner()
-
     def fail_validation(*_args: object, **_kwargs: object) -> ValidationResult:
         return ValidationResult(False, issues=["redacted validation issue"])
 
     monkeypatch.setattr("spreadsafe.cli.validate_output", fail_validation)
 
-    result = runner.invoke(app, ["sanitize", str(input_dir), "--out", str(output_dir)])
+    result = invoke_cli(["sanitize", str(input_dir), "--out", str(output_dir)])
 
     assert result.exit_code == 1
     assert "redacted validation issue" in result.stderr
@@ -935,14 +1061,12 @@ def test_sanitize_validation_failure_preserves_existing_output(
     (input_dir / "new.csv").write_text("status\nNEW\n", encoding="utf-8")
     (old_sanitized / "old.csv").write_text("status\nOLD\n", encoding="utf-8")
     (output_dir / ".spreadsafe-package").write_text("spreadsafe\n", encoding="utf-8")
-    runner = CliRunner()
-
     def fail_validation(*_args: object, **_kwargs: object) -> ValidationResult:
         return ValidationResult(False, issues=["redacted validation issue"])
 
     monkeypatch.setattr("spreadsafe.cli.validate_output", fail_validation)
 
-    result = runner.invoke(app, ["sanitize", str(input_dir), "--out", str(output_dir)])
+    result = invoke_cli(["sanitize", str(input_dir), "--out", str(output_dir)])
 
     assert result.exit_code == 1
     assert (old_sanitized / "old.csv").exists()
@@ -954,17 +1078,15 @@ def test_scan_and_sanitize_clear_stale_sibling_outputs(tmp_path: Path) -> None:
     output_dir = tmp_path / "codex-safe"
     input_dir.mkdir()
     make_workbook(input_dir / "orders.xlsx")
-    runner = CliRunner()
-
-    scan_result = runner.invoke(app, ["scan", str(input_dir), "--out", str(output_dir)])
-    sanitize_result = runner.invoke(app, ["sanitize", str(input_dir), "--out", str(output_dir)])
+    scan_result = invoke_cli(["scan", str(input_dir), "--out", str(output_dir)])
+    sanitize_result = invoke_cli(["sanitize", str(input_dir), "--out", str(output_dir)])
 
     assert scan_result.exit_code == 0
     assert sanitize_result.exit_code == 0
     assert (output_dir / "sanitized" / "orders.xlsx").exists()
     assert not (output_dir / "reports").exists()
 
-    second_scan_result = runner.invoke(app, ["scan", str(input_dir), "--out", str(output_dir)])
+    second_scan_result = invoke_cli(["scan", str(input_dir), "--out", str(output_dir)])
 
     assert second_scan_result.exit_code == 0
     assert (output_dir / "reports" / "workbook-report.md").exists()
@@ -980,9 +1102,7 @@ def test_sanitize_command_rejects_unmarked_stale_sanitized_files(tmp_path: Path)
     make_workbook(input_dir / "orders.xlsx")
     stale_file = stale_sanitized / "old.csv"
     stale_file.write_text("email\njan@example.com\n", encoding="utf-8")
-    runner = CliRunner()
-
-    result = runner.invoke(app, ["sanitize", str(input_dir), "--out", str(output_dir)])
+    result = invoke_cli(["sanitize", str(input_dir), "--out", str(output_dir)])
 
     assert result.exit_code == 2
     assert "Refusing to clear existing output directory" in result.stderr
@@ -1082,9 +1202,7 @@ def test_sanitize_command_redacts_formula_like_csv_headers(tmp_path: Path) -> No
     output_dir = tmp_path / "codex-safe"
     input_dir.mkdir()
     (input_dir / "headers.csv").write_text("=HYPERLINK(\"https://attacker.example\")\nvalue\n", encoding="utf-8")
-    runner = CliRunner()
-
-    result = runner.invoke(app, ["sanitize", str(input_dir), "--out", str(output_dir)])
+    result = invoke_cli(["sanitize", str(input_dir), "--out", str(output_dir)])
 
     assert result.exit_code == 0
     sanitized = (output_dir / "sanitized" / "headers.csv").read_text(encoding="utf-8")
@@ -1122,14 +1240,13 @@ def test_csv_sanitizer_preserves_duplicate_headers_positionally(tmp_path: Path) 
     package_directory(input_dir, output_dir)
 
     sanitized = (output_dir / "sanitized" / "duplicate.csv").read_text(encoding="utf-8")
-    assert sanitized == "Person 0001,Person 0001\nPerson 0002,Person 0003\n"
+    assert sanitized == "SPREADSAFE_PERSON_0001,SPREADSAFE_PERSON_0001\nSPREADSAFE_PERSON_0002,SPREADSAFE_PERSON_0003\n"
 
 
 def test_scan_command_rejects_invalid_paths_without_traceback(tmp_path: Path) -> None:
-    runner = CliRunner()
     missing_input = tmp_path / "missing"
 
-    missing_result = runner.invoke(app, ["scan", str(missing_input), "--out", str(tmp_path / "out")])
+    missing_result = invoke_cli(["scan", str(missing_input), "--out", str(tmp_path / "out")])
 
     assert missing_result.exit_code == 2
     assert "Input directory does not exist" in missing_result.stderr
@@ -1137,7 +1254,7 @@ def test_scan_command_rejects_invalid_paths_without_traceback(tmp_path: Path) ->
 
     input_dir = tmp_path / "input"
     input_dir.mkdir()
-    nested_result = runner.invoke(app, ["scan", str(input_dir), "--out", str(input_dir / "out")])
+    nested_result = invoke_cli(["scan", str(input_dir), "--out", str(input_dir / "out")])
 
     assert nested_result.exit_code == 2
     assert "Output directory cannot be inside input directory" in nested_result.stderr
@@ -1149,12 +1266,10 @@ def test_scan_command_clears_stale_reports_in_owned_output(tmp_path: Path) -> No
     output_dir = tmp_path / "scan-output"
     input_dir.mkdir()
     make_workbook(input_dir / "orders.xlsx")
-    runner = CliRunner()
-
-    first_result = runner.invoke(app, ["scan", str(input_dir), "--out", str(output_dir)])
+    first_result = invoke_cli(["scan", str(input_dir), "--out", str(output_dir)])
     stale_report = output_dir / "reports" / "old.md"
     stale_report.write_text("stale report\n", encoding="utf-8")
-    second_result = runner.invoke(app, ["scan", str(input_dir), "--out", str(output_dir)])
+    second_result = invoke_cli(["scan", str(input_dir), "--out", str(output_dir)])
 
     assert first_result.exit_code == 0
     assert second_result.exit_code == 0
@@ -1169,9 +1284,7 @@ def test_package_command_rejects_scalar_config_lists_without_traceback(tmp_path:
     input_dir.mkdir()
     (input_dir / "spreadsafe.yml").write_text("sensitive_columns: Email\n", encoding="utf-8")
     (input_dir / "clients.csv").write_text("Email\njan@example.com\n", encoding="utf-8")
-    runner = CliRunner()
-
-    result = runner.invoke(app, ["package", str(input_dir), "--out", str(output_dir)])
+    result = invoke_cli(["package", str(input_dir), "--out", str(output_dir)])
 
     assert result.exit_code == 2
     assert "sensitive_columns must be a list of strings" in result.stderr
@@ -1184,9 +1297,7 @@ def test_package_command_rejects_non_mapping_config_without_traceback(tmp_path: 
     input_dir.mkdir()
     (input_dir / "spreadsafe.yml").write_text("- Email\n", encoding="utf-8")
     (input_dir / "clients.csv").write_text("Email\njan@example.com\n", encoding="utf-8")
-    runner = CliRunner()
-
-    result = runner.invoke(app, ["package", str(input_dir), "--out", str(output_dir)])
+    result = invoke_cli(["package", str(input_dir), "--out", str(output_dir)])
 
     assert result.exit_code == 2
     assert "spreadsafe.yml must contain a mapping" in result.stderr
@@ -1198,9 +1309,7 @@ def test_package_command_creates_marker_sanitized_files_and_reports(tmp_path: Pa
     output_dir = tmp_path / "codex-safe"
     input_dir.mkdir()
     make_workbook(input_dir / "orders.xlsx")
-    runner = CliRunner()
-
-    result = runner.invoke(app, ["package", str(input_dir), "--out", str(output_dir)])
+    result = invoke_cli(["package", str(input_dir), "--out", str(output_dir)])
 
     assert result.exit_code == 0
     assert (output_dir / ".spreadsafe-package").read_text(encoding="utf-8") == "spreadsafe\n"
@@ -1219,9 +1328,7 @@ def test_package_command_refuses_to_clear_unmarked_generated_output(
     make_workbook(input_dir / "orders.xlsx")
     stale_file = stale_sanitized / "old.csv"
     stale_file.write_text("status\nSTALE\n", encoding="utf-8")
-    runner = CliRunner()
-
-    result = runner.invoke(app, ["package", str(input_dir), "--out", str(output_dir)])
+    result = invoke_cli(["package", str(input_dir), "--out", str(output_dir)])
 
     assert result.exit_code == 2
     assert "Refusing to clear existing output directory" in result.stderr
@@ -1255,6 +1362,38 @@ def test_package_directory_validation_failure_preserves_existing_output(
     assert (old_sanitized / "old.csv").exists()
     assert not (old_sanitized / "orders.xlsx").exists()
     assert (old_reports / "old.md").exists()
+
+
+def test_package_rechecks_output_paths_before_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    input_dir = tmp_path / "input"
+    output_dir = tmp_path / "codex-safe"
+    old_sanitized = output_dir / "sanitized"
+    external_dir = tmp_path / "external"
+    input_dir.mkdir()
+    old_sanitized.mkdir(parents=True)
+    external_dir.mkdir()
+    make_workbook(input_dir / "orders.xlsx")
+    old_file = old_sanitized / "old.csv"
+    sentinel = external_dir / "sentinel.csv"
+    old_file.write_text("status\nOLD\n", encoding="utf-8")
+    sentinel.write_text("status\nKEEP\n", encoding="utf-8")
+    (output_dir / ".spreadsafe-package").write_text("spreadsafe\n", encoding="utf-8")
+
+    def swap_sanitized_with_symlink(*_args: object, **_kwargs: object) -> ValidationResult:
+        shutil.rmtree(old_sanitized)
+        old_sanitized.symlink_to(external_dir, target_is_directory=True)
+        return ValidationResult(True)
+
+    monkeypatch.setattr("spreadsafe.cli.validate_output", swap_sanitized_with_symlink)
+
+    with pytest.raises(ValueError, match="symlink"):
+        package_directory(input_dir, output_dir)
+
+    assert sentinel.exists()
+    assert old_sanitized.is_symlink()
 
 
 def test_replace_generated_output_restores_existing_output_on_move_failure(
@@ -1302,9 +1441,7 @@ def test_package_command_rejects_existing_output_file_without_traceback(tmp_path
     input_dir.mkdir()
     output_path.write_text("not a directory", encoding="utf-8")
     (input_dir / "clients.csv").write_text("Status\nACTIVE\n", encoding="utf-8")
-    runner = CliRunner()
-
-    result = runner.invoke(app, ["package", str(input_dir), "--out", str(output_path)])
+    result = invoke_cli(["package", str(input_dir), "--out", str(output_path)])
 
     assert result.exit_code == 2
     assert "is not a directory" in result.stderr
@@ -1512,13 +1649,13 @@ def test_package_sanitizes_sensitive_filenames_and_sheet_titles(tmp_path: Path) 
     assert len(sanitized_files) == 1
     assert "jan@example.com" not in sanitized_files[0].name
     sanitized = load_workbook(sanitized_files[0], data_only=False)
-    assert sanitized.sheetnames == ["Sheet 0001"]
+    assert sanitized.sheetnames == ["SPREADSAFE_SHEET_0001"]
     workbook_report = (output_dir / "reports" / "workbook-report.json").read_text(encoding="utf-8")
     markdown_report = (output_dir / "reports" / "workbook-report.md").read_text(encoding="utf-8")
     assert "jan@example.com" not in workbook_report
-    assert "Sheet 0001" not in workbook_report
+    assert "SPREADSAFE_SHEET_0001" not in workbook_report
     assert "jan@example.com" not in markdown_report
-    assert "Sheet 0001" not in markdown_report
+    assert "SPREADSAFE_SHEET_0001" not in markdown_report
     assert validate_output(output_dir).passed
 
 
@@ -1960,7 +2097,7 @@ def test_validate_rejects_sensitive_xlsx_auto_filter_values(tmp_path: Path) -> N
     workbook = Workbook()
     sheet = workbook.active
     sheet.append(["Email"])
-    sheet.append(["EMAIL 0001"])
+    sheet.append(["SPREADSAFE_EMAIL_0001"])
     sheet.auto_filter.ref = "A1:A2"
     sheet.auto_filter.add_filter_column(0, ["jan@example.com"])
     workbook.save(sanitized_dir / "filters.xlsx")
@@ -2041,7 +2178,7 @@ def test_package_handles_overlapping_regon_and_phone_detection(tmp_path: Path) -
     assert result.passed
     sanitized = (output_dir / "sanitized" / "companies.csv").read_text(encoding="utf-8")
     assert "012345678" not in sanitized
-    assert "REGON 0001" in sanitized
+    assert "SPREADSAFE_REGON_0001" in sanitized
 
 
 def test_package_does_not_overwrite_filename_token_collisions(tmp_path: Path) -> None:
@@ -2051,7 +2188,7 @@ def test_package_does_not_overwrite_filename_token_collisions(tmp_path: Path) ->
     safe_workbook = Workbook()
     safe_workbook.active.append(["Status"])
     safe_workbook.active.append(["SAFE"])
-    safe_workbook.save(input_dir / "file_0001.xlsx")
+    safe_workbook.save(input_dir / "spreadsafe_file_0001.xlsx")
     sensitive_workbook = Workbook()
     sensitive_workbook.active.append(["Status"])
     sensitive_workbook.active.append(["PRIVATE"])
@@ -2061,10 +2198,10 @@ def test_package_does_not_overwrite_filename_token_collisions(tmp_path: Path) ->
 
     assert result.passed
     sanitized_files = sorted(path.name for path in (output_dir / "sanitized").glob("*.xlsx"))
-    assert sanitized_files == ["file_0001.xlsx", "file_0001_2.xlsx"]
+    assert sanitized_files == ["spreadsafe_file_0001.xlsx", "spreadsafe_file_0001_2.xlsx"]
     risk_report = (output_dir / "reports" / "risk-report.md").read_text(encoding="utf-8")
     assert "destination name was adjusted" in risk_report
-    assert "file_0001.xlsx" not in risk_report
+    assert "spreadsafe_file_0001.xlsx" not in risk_report
     statuses = {
         load_workbook(path, data_only=False).active["A2"].value
         for path in (output_dir / "sanitized").glob("*.xlsx")
@@ -2083,7 +2220,7 @@ def test_package_sanitizes_reserved_example_test_input_emails(tmp_path: Path) ->
     assert result.passed
     sanitized = (output_dir / "sanitized" / "emails.csv").read_text(encoding="utf-8")
     assert "customer@example.test" not in sanitized
-    assert "EMAIL 0001" in sanitized
+    assert "SPREADSAFE_EMAIL_0001" in sanitized
 
 
 def test_package_sanitizes_generated_shaped_input_emails(tmp_path: Path) -> None:
@@ -2097,7 +2234,7 @@ def test_package_sanitizes_generated_shaped_input_emails(tmp_path: Path) -> None
     assert result.passed
     sanitized = (output_dir / "sanitized" / "emails.csv").read_text(encoding="utf-8")
     assert "user0001@example.test" not in sanitized
-    assert "EMAIL 0001" in sanitized
+    assert "SPREADSAFE_EMAIL_0001" in sanitized
 
 
 def test_xlsx_deny_columns_override_amount_date_and_formula_transforms(tmp_path: Path) -> None:
@@ -2173,9 +2310,37 @@ def test_configured_sensitive_date_and_amount_columns_are_tokenized(tmp_path: Pa
     sanitized = (output_dir / "sanitized" / "values.csv").read_text(encoding="utf-8")
     assert "2025-01-15" not in sanitized
     assert "123.45" not in sanitized
-    assert "VALUE 0001" in sanitized
-    assert "VALUE 0002" in sanitized
+    assert "SPREADSAFE_VALUE_0001" in sanitized
+    assert "SPREADSAFE_VALUE_0002" in sanitized
     assert validate_output(output_dir).passed
+
+
+def test_configured_sensitive_generated_shaped_values_are_retokenized(tmp_path: Path) -> None:
+    input_dir = tmp_path / "input"
+    output_dir = tmp_path / "codex-safe"
+    input_dir.mkdir()
+    (input_dir / "spreadsafe.yml").write_text("sensitive_columns:\n  - Name\n", encoding="utf-8")
+    (input_dir / "values.csv").write_text("Name\nPerson 0001\n", encoding="utf-8")
+
+    result = package_directory(input_dir, output_dir)
+
+    assert result.passed
+    sanitized = (output_dir / "sanitized" / "values.csv").read_text(encoding="utf-8")
+    assert "Person 0001" not in sanitized
+    assert "SPREADSAFE_PERSON_0001" in sanitized
+    assert validate_output(output_dir, Config(sensitive_columns=["Name"])).passed
+
+
+def test_validate_rejects_old_generated_shaped_values_in_sensitive_columns(tmp_path: Path) -> None:
+    output_dir = tmp_path / "codex-safe"
+    sanitized_dir = output_dir / "sanitized"
+    sanitized_dir.mkdir(parents=True)
+    (sanitized_dir / "values.csv").write_text("Name\nPerson 0001\n", encoding="utf-8")
+
+    result = validate_output(output_dir, Config(sensitive_columns=["Name"]))
+
+    assert not result.passed
+    assert any("configured sensitive value remains" in issue for issue in result.issues)
 
 
 def test_numeric_identifier_shaped_amounts_are_tokenized_not_perturbed(tmp_path: Path) -> None:
@@ -2194,9 +2359,9 @@ def test_numeric_identifier_shaped_amounts_are_tokenized_not_perturbed(tmp_path:
     assert result.passed
     sanitized_workbook = load_workbook(output_dir / "sanitized" / "amounts.xlsx", data_only=False)
     xlsx_value = sanitized_workbook.active["A2"].value
-    assert xlsx_value == "REGON 0001"
+    assert xlsx_value == "SPREADSAFE_REGON_0001"
     sanitized_csv = (output_dir / "sanitized" / "amounts.csv").read_text(encoding="utf-8")
-    assert "REGON 0001" in sanitized_csv
+    assert "SPREADSAFE_REGON_0001" in sanitized_csv
     assert "NIP" not in sanitized_csv
     assert "123456789" not in sanitized_csv
     assert validate_output(output_dir).passed
@@ -2232,21 +2397,23 @@ def test_package_tokenizes_generic_contact_names(tmp_path: Path) -> None:
     assert result.passed
     sanitized = (output_dir / "sanitized" / "contacts.csv").read_text(encoding="utf-8")
     assert "Jan Kowalski" not in sanitized
-    assert "Person 0001" in sanitized
+    assert "SPREADSAFE_PERSON_0001" in sanitized
     assert validate_output(output_dir).passed
 
 
 def test_validator_recognizes_generated_tokens_as_safe() -> None:
-    assert _is_safe_generated_value("EMAIL 0001")
-    assert _is_safe_generated_value("PHONE 0001")
-    assert _is_safe_generated_value("IBAN 0001")
-    assert _is_safe_generated_value("NIP 0001")
-    assert _is_safe_generated_value("REGON 0001")
-    assert _is_safe_generated_value("VAT_ID 0001")
-    assert _is_safe_generated_value("VALUE 0001")
-    assert _is_safe_generated_value("INV-FAKE-0001")
-    assert _is_safe_generated_value("Company 0001")
-    assert _is_safe_generated_value("Person 0001")
+    assert _is_safe_generated_value("SPREADSAFE_EMAIL_0001")
+    assert _is_safe_generated_value("SPREADSAFE_PHONE_0001")
+    assert _is_safe_generated_value("SPREADSAFE_IBAN_0001")
+    assert _is_safe_generated_value("SPREADSAFE_NIP_0001")
+    assert _is_safe_generated_value("SPREADSAFE_REGON_0001")
+    assert _is_safe_generated_value("SPREADSAFE_VAT_ID_0001")
+    assert _is_safe_generated_value("SPREADSAFE_VALUE_0001")
+    assert _is_safe_generated_value("SPREADSAFE_INVOICE_0001")
+    assert _is_safe_generated_value("SPREADSAFE_COMPANY_0001")
+    assert _is_safe_generated_value("SPREADSAFE_PERSON_0001")
+    assert not _is_safe_generated_value("Person 0001")
+    assert not _is_safe_generated_value("EMAIL 0001")
     assert not _is_safe_generated_value("jan@example.com")
 
 
@@ -2262,14 +2429,12 @@ def test_scan_command_applies_sensitive_column_config_to_reports(tmp_path: Path)
         "Client Name,Status\nGlobex,ACTIVE\n",
         encoding="utf-8",
     )
-    runner = CliRunner()
-
-    result = runner.invoke(app, ["scan", str(input_dir), "--out", str(output_dir)])
+    result = invoke_cli(["scan", str(input_dir), "--out", str(output_dir)])
 
     assert result.exit_code == 0
     report = (output_dir / "reports" / "workbook-report.md").read_text(encoding="utf-8")
     assert "Globex" not in report
-    assert "Company 0001" in report
+    assert "SPREADSAFE_COMPANY_0001" in report
 
 
 def test_scan_command_honors_max_sample_rows_per_sheet(tmp_path: Path) -> None:
@@ -2278,9 +2443,7 @@ def test_scan_command_honors_max_sample_rows_per_sheet(tmp_path: Path) -> None:
     input_dir.mkdir()
     (input_dir / "spreadsafe.yml").write_text("max_sample_rows_per_sheet: 1\n", encoding="utf-8")
     (input_dir / "statuses.csv").write_text("Status\nACTIVE\nARCHIVED\n", encoding="utf-8")
-    runner = CliRunner()
-
-    result = runner.invoke(app, ["scan", str(input_dir), "--out", str(output_dir)])
+    result = invoke_cli(["scan", str(input_dir), "--out", str(output_dir)])
 
     assert result.exit_code == 0
     report = json.loads((output_dir / "reports" / "workbook-report.json").read_text(encoding="utf-8"))
@@ -2333,4 +2496,38 @@ def _add_media_part(path: Path) -> None:
         for info in source.infolist():
             destination.writestr(info, source.read(info.filename))
         destination.writestr("xl/media/image1.txt", "jan@example.com")
+    replacement.replace(path)
+
+
+def _add_macro_and_activex_parts(path: Path) -> None:
+    replacement = path.with_name(f"{path.stem}-with-active-content{path.suffix}")
+    with zipfile.ZipFile(path, "r") as source, zipfile.ZipFile(replacement, "w") as destination:
+        for info in source.infolist():
+            data = source.read(info.filename)
+            if info.filename == "[Content_Types].xml":
+                data = data.replace(
+                    b"</Types>",
+                    b'<Override PartName="/xl/vbaProject.bin" ContentType="application/vnd.ms-office.vbaProject"/>'
+                    b'<Override PartName="/xl/activeX/activeX1.bin" ContentType="application/vnd.ms-office.activeX"/>'
+                    b'<Override PartName="/xl/ctrlProps/ctrlProp1.xml" ContentType="application/vnd.ms-excel.controlproperties+xml"/>'
+                    b"</Types>",
+                )
+            elif info.filename == "xl/_rels/workbook.xml.rels":
+                data = data.replace(
+                    b"</Relationships>",
+                    b'<Relationship Type="http://schemas.microsoft.com/office/2006/relationships/vbaProject" Target="vbaProject.bin" Id="rIdMacro"/>'
+                    b"</Relationships>",
+                )
+            destination.writestr(info, data)
+        destination.writestr(
+            "xl/worksheets/_rels/sheet1.xml.rels",
+            (
+                '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+                '<Relationship Id="rIdActiveX" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/control" Target="../activeX/activeX1.bin"/>'
+                "</Relationships>"
+            ),
+        )
+        destination.writestr("xl/vbaProject.bin", b"macro")
+        destination.writestr("xl/activeX/activeX1.bin", b"activex")
+        destination.writestr("xl/ctrlProps/ctrlProp1.xml", "<controlPr/>")
     replacement.replace(path)

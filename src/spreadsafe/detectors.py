@@ -56,11 +56,11 @@ def load_config(path: Path | None) -> Config:
             "preserve_status_values",
             True,
         ),
-            max_sample_rows_per_sheet=_positive_int(
-                raw.get("max_sample_rows_per_sheet"),
-                "max_sample_rows_per_sheet",
-                500,
-            ),
+        max_sample_rows_per_sheet=_positive_int(
+            raw.get("max_sample_rows_per_sheet"),
+            "max_sample_rows_per_sheet",
+            500,
+        ),
         sensitive_columns=_string_list(raw.get("sensitive_columns"), "sensitive_columns"),
         safe_enum_columns=_string_list(raw.get("safe_enum_columns"), "safe_enum_columns"),
         deny_columns=_string_list(raw.get("deny_columns"), "deny_columns"),
@@ -70,7 +70,6 @@ def load_config(path: Path | None) -> Config:
 class Detector:
     _presidio_analyzer: ClassVar[Any | None] = None
     _presidio_failed: ClassVar[bool] = False
-    _presidio_failed_locales: ClassVar[set[str]] = set()
 
     def __init__(self, config: Config) -> None:
         self.config = config
@@ -190,8 +189,6 @@ class Detector:
             locales.append("en")
         results: list[Any] = []
         for locale in locales:
-            if locale in self._presidio_failed_locales:
-                continue
             try:
                 results = Detector._presidio_analyzer.analyze(
                     text=value,
@@ -220,6 +217,23 @@ class Detector:
                 )
             )
         return detections
+
+
+def non_overlapping_detections(detections: list[Detection] | tuple[Detection, ...]) -> list[Detection]:
+    ordered = sorted(
+        detections,
+        key=lambda item: (
+            item.start,
+            _detection_priority(item.label),
+            -(item.end - item.start),
+        ),
+    )
+    selected: list[Detection] = []
+    for detection in ordered:
+        if any(detection.start < existing.end and detection.end > existing.start for existing in selected):
+            continue
+        selected.append(detection)
+    return selected
 
 
 def _bool_value(raw: Any, field_name: str, default: bool) -> bool:
@@ -261,6 +275,21 @@ def _presidio_label(entity_type: str) -> str | None:
         "PHONE_NUMBER": "PHONE",
         "IBAN_CODE": "IBAN",
     }.get(entity_type)
+
+
+def _detection_priority(label: str) -> int:
+    priorities = {
+        "EMAIL": 0,
+        "IBAN": 1,
+        "PESEL": 2,
+        "VAT_ID": 3,
+        "REGON": 4,
+        "NIP": 5,
+        "INVOICE_ID": 6,
+        "PHONE": 7,
+        "COMPANY": 8,
+    }
+    return priorities.get(label, 99)
 
 
 PATTERNS: dict[str, re.Pattern[str]] = {

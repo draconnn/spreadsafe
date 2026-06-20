@@ -6,10 +6,10 @@ from spreadsafe.mapping import PseudonymMapper
 def test_stable_pseudonyms_are_reused_across_labels() -> None:
     mapper = PseudonymMapper(seed="fixture")
 
-    assert mapper.token("COMPANY", "ACME Sp. z o.o.") == "Company 0001"
-    assert mapper.token("COMPANY", "ACME Sp. z o.o.") == "Company 0001"
-    assert mapper.token("COMPANY", "Globex") == "Company 0002"
-    assert mapper.token("EMAIL", "jan@example.com") == "EMAIL 0001"
+    assert mapper.token("COMPANY", "ACME Sp. z o.o.") == "SPREADSAFE_COMPANY_0001"
+    assert mapper.token("COMPANY", "ACME Sp. z o.o.") == "SPREADSAFE_COMPANY_0001"
+    assert mapper.token("COMPANY", "Globex") == "SPREADSAFE_COMPANY_0002"
+    assert mapper.token("EMAIL", "jan@example.com") == "SPREADSAFE_EMAIL_0001"
 
 
 def test_dates_shift_by_one_stable_offset() -> None:

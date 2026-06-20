@@ -5,7 +5,7 @@ from pathlib import Path
 import json
 import re
 
-from spreadsafe.detectors import Config, Detection, Detector, load_config
+from spreadsafe.detectors import Config, Detector, load_config, non_overlapping_detections
 from spreadsafe.scanner import WorkbookReport
 
 
@@ -36,41 +36,13 @@ def write_reports(
 
 def _redact_sensitive_text(text: str, detector: Detector) -> str:
     redacted = text
-    for detection in sorted(_non_overlapping_detections(detector.detect_text(text)), key=lambda item: item.start, reverse=True):
+    for detection in sorted(
+        non_overlapping_detections(detector.detect_text(text)),
+        key=lambda item: item.start,
+        reverse=True,
+    ):
         redacted = redacted[: detection.start] + f"[REDACTED_{detection.label}]" + redacted[detection.end :]
-    return re.sub(r"\bSheet \d{4}\b", "[REDACTED_SHEET]", redacted)
-
-
-def _non_overlapping_detections(detections: list[Detection]) -> list[Detection]:
-    ordered = sorted(
-        detections,
-        key=lambda item: (
-            item.start,
-            _detection_priority(item.label),
-            -(item.end - item.start),
-        ),
-    )
-    selected: list[Detection] = []
-    for detection in ordered:
-        if any(detection.start < existing.end and detection.end > existing.start for existing in selected):
-            continue
-        selected.append(detection)
-    return selected
-
-
-def _detection_priority(label: str) -> int:
-    priorities = {
-        "EMAIL": 0,
-        "IBAN": 1,
-        "PESEL": 2,
-        "VAT_ID": 3,
-        "REGON": 4,
-        "NIP": 5,
-        "INVOICE_ID": 6,
-        "PHONE": 7,
-        "COMPANY": 8,
-    }
-    return priorities.get(label, 99)
+    return re.sub(r"\bSPREADSAFE_SHEET_\d{4}\b", "[REDACTED_SHEET]", redacted)
 
 
 def _markdown_report(reports: list[WorkbookReport]) -> str:

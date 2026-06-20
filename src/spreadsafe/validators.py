@@ -14,10 +14,10 @@ from spreadsafe.detectors import Config, Detection, Detector, load_config
 from spreadsafe.sanitizer import (
     _data_validation_has_external_reference,
     _data_validation_text,
+    _is_unsupported_ooxml_part,
     _looks_like_csv_formula,
     _looks_like_amount_column,
     _looks_like_date_column,
-    _looks_like_external_formula,
     _parse_decimal,
     _parse_iso_date,
 )
@@ -179,11 +179,12 @@ def _validate_xlsx(
                     f"{workbook_name}:{worksheet_name}: row 1 column {column_index} "
                     "contains sensitive header"
                 )
-        for detection in detector.detect_text(worksheet.title):
-            issues.append(
-                f"{workbook_name}:{worksheet_name}: sheet title contains "
-                f"{_validation_issue_label(detection)}"
-            )
+        if not _is_safe_generated_value(worksheet.title):
+            for detection in detector.detect_text(worksheet.title):
+                issues.append(
+                    f"{workbook_name}:{worksheet_name}: sheet title contains "
+                    f"{_validation_issue_label(detection)}"
+                )
         for location, value in _worksheet_header_footer_values(worksheet).items():
             for detection in detector.detect_text(value):
                 if _is_safe_generated_value(detection.value):
@@ -242,24 +243,7 @@ def _validate_xlsx(
                             )
                     continue
                 if value.startswith("="):
-                    header = headers[cell.column - 1] if cell.column - 1 < len(headers) else ""
-                    if _formula_is_in_sensitive_column(detector, header):
-                        issues.append(
-                            f"{workbook_name}:{worksheet_name}:{cell.coordinate}: "
-                            "formula remains in sensitive column"
-                        )
-                    if _looks_like_external_formula(value):
-                        issues.append(
-                            f"{workbook_name}:{worksheet_name}:{cell.coordinate}: "
-                            "formula contains external workbook reference"
-                        )
-                    for detection in detector.detect_text(value):
-                        if _is_safe_generated_value(detection.value):
-                            continue
-                        issues.append(
-                            f"{workbook_name}:{worksheet_name}:{cell.coordinate}: "
-                            f"formula contains {_validation_issue_label(detection)}"
-                        )
+                    issues.append(f"{workbook_name}:{worksheet_name}:{cell.coordinate}: formula remains")
                     continue
                 header = headers[cell.column - 1] if cell.column - 1 < len(headers) else ""
                 if _value_violates_config_sensitive(detector, header, value):
@@ -286,13 +270,6 @@ def _validate_text_file(file_path: Path, detector: Detector, issues: list[str]) 
         issues.append(f"{file_name}: {_validation_issue_label(detection)} remains")
 
 
-def _formula_is_in_sensitive_column(detector: Detector, header: str) -> bool:
-    decision = detector.classify_cell(header, "placeholder")
-    return decision.action in {"redact", "tokenize"} and bool(
-        {"column_heuristic", "config_sensitive_column"} & set(decision.reasons)
-    )
-
-
 def _external_link_part_names(file_path: Path) -> list[str]:
     names: list[str] = []
     with zipfile.ZipFile(file_path, "r") as workbook_zip:
@@ -315,20 +292,7 @@ def _unsupported_ooxml_part_names(file_path: Path) -> list[str]:
     names: list[str] = []
     with zipfile.ZipFile(file_path, "r") as workbook_zip:
         for name in workbook_zip.namelist():
-            if name.startswith(
-                (
-                    "xl/chartsheets/",
-                    "xl/media/",
-                    "xl/drawings/",
-                    "xl/charts/",
-                    "xl/embeddings/",
-                    "xl/pivotCache/",
-                    "xl/pivotTables/",
-                    "xl/printerSettings/",
-                    "xl/tables/",
-                    "customXml/",
-                )
-            ):
+            if _is_unsupported_ooxml_part(name):
                 names.append(name)
     return names
 
@@ -434,11 +398,9 @@ def _value_violates_config_sensitive(detector: Detector, header: str, value: Any
 def _is_safe_generated_value(value: str) -> bool:
     return bool(
         re.fullmatch(
-            r"(?:EMAIL|PHONE|IBAN|PESEL|NIP|REGON|VAT_ID) \d{4}|"
-            r"VALUE \d{4}|"
-            r"INV-FAKE-\d{4}|"
-            r"(?:Company|Person|Sheet) \d{4}|"
-            r"(?:file|directory)_\d{4}",
+            r"SPREADSAFE_(?:EMAIL|PHONE|IBAN|PESEL|NIP|REGON|VAT_ID|VALUE|INVOICE|"
+            r"COMPANY|PERSON|SHEET)_\d{4}|"
+            r"spreadsafe_(?:file|directory)_\d{4}",
             value,
         )
     )

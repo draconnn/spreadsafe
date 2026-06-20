@@ -39,7 +39,6 @@ def test_presidio_analyzer_uses_configured_locale(monkeypatch: pytest.MonkeyPatc
 
     monkeypatch.setattr(Detector, "_presidio_analyzer", StubAnalyzer())
     monkeypatch.setattr(Detector, "_presidio_failed", False)
-    monkeypatch.setattr(Detector, "_presidio_failed_locales", set())
 
     Detector(Config(locale="pl")).detect_text("Jan Kowalski")
 
@@ -66,14 +65,12 @@ def test_presidio_locale_failure_does_not_disable_other_locales(
 
     monkeypatch.setattr(Detector, "_presidio_analyzer", StubAnalyzer())
     monkeypatch.setattr(Detector, "_presidio_failed", False)
-    monkeypatch.setattr(Detector, "_presidio_failed_locales", set())
 
     assert labels(Detector(Config(locale="pl")).detect_text("Jan Kowalski")) == {"PERSON"}
     results = Detector(Config(locale="en")).detect_text("John Smith")
 
     assert labels(results) == {"PERSON"}
     assert calls == ["pl", "en", "en"]
-    assert Detector._presidio_failed_locales == set()
 
 
 def test_transient_presidio_failure_does_not_disable_locale(
@@ -99,7 +96,6 @@ def test_transient_presidio_failure_does_not_disable_locale(
 
     monkeypatch.setattr(Detector, "_presidio_analyzer", StubAnalyzer())
     monkeypatch.setattr(Detector, "_presidio_failed", False)
-    monkeypatch.setattr(Detector, "_presidio_failed_locales", set())
 
     assert Detector(Config(locale="pl")).detect_text("Jan Kowalski") == []
     assert labels(Detector(Config(locale="pl")).detect_text("Jan Kowalski")) == {"PERSON"}

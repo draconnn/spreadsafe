@@ -14,8 +14,29 @@ from openpyxl.cell.cell import MergedCell
 from openpyxl import load_workbook
 from openpyxl.worksheet.filters import AutoFilter
 
-from spreadsafe.detectors import Config, Decision, Detection, Detector
+from spreadsafe.detectors import Config, Decision, Detector, non_overlapping_detections
 from spreadsafe.mapping import PseudonymMapper
+
+
+UNSUPPORTED_OOXML_PART_PREFIXES = (
+    "xl/chartsheets/",
+    "xl/media/",
+    "xl/drawings/",
+    "xl/charts/",
+    "xl/embeddings/",
+    "xl/pivotCache/",
+    "xl/pivotTables/",
+    "xl/printerSettings/",
+    "xl/tables/",
+    "xl/activeX/",
+    "xl/ctrlProps/",
+    "customXml/",
+)
+
+UNSUPPORTED_OOXML_PART_NAMES = {
+    "xl/vbaProject.bin",
+    "xl/vbaProjectSignature.bin",
+}
 
 
 class Sanitizer:
@@ -212,15 +233,8 @@ class Sanitizer:
             self.risks.append(f"{location}: redacted (config_deny_column)")
             return "[REDACTED_TEXT]"
         if isinstance(value, str) and value.startswith("="):
-            decision = self.detector.classify_cell(column_name, value)
-            if (
-                decision.action != "preserve"
-                or self.detector.detect_text(value)
-                or _looks_like_external_formula(value)
-            ):
-                self.risks.append(f"{location}: formula redacted")
-                return "[REDACTED_FORMULA]"
-            return value
+            self.risks.append(f"{location}: formula redacted")
+            return "[REDACTED_FORMULA]"
         decision = self.detector.classify_cell(column_name, value)
         if decision.action == "redact":
             self.risks.append(f"{location}: redacted ({', '.join(decision.reasons)})")
@@ -239,7 +253,7 @@ class Sanitizer:
 
     def _tokenize(self, value: Any, decision: Decision) -> str:
         text = str(value)
-        detections = _non_overlapping_detections(decision.detections)
+        detections = non_overlapping_detections(decision.detections)
         if len(detections) > 1 and decision.label not in {"COMPANY", "PERSON"}:
             replaced = text
             for detection in sorted(detections, key=lambda item: item.start, reverse=True):
@@ -373,38 +387,6 @@ def _data_validation_values(validation: Any) -> tuple[Any, ...]:
 def _is_numeric_string(value: str) -> bool:
     parsed = _parse_decimal(value)
     return parsed is not None and parsed.is_finite()
-
-
-def _non_overlapping_detections(detections: tuple[Detection, ...]) -> list[Detection]:
-    ordered = sorted(
-        detections,
-        key=lambda item: (
-            item.start,
-            _detection_priority(item.label),
-            -(item.end - item.start),
-        ),
-    )
-    selected: list[Detection] = []
-    for detection in ordered:
-        if any(detection.start < existing.end and detection.end > existing.start for existing in selected):
-            continue
-        selected.append(detection)
-    return selected
-
-
-def _detection_priority(label: str) -> int:
-    priorities = {
-        "EMAIL": 0,
-        "IBAN": 1,
-        "PESEL": 2,
-        "VAT_ID": 3,
-        "REGON": 4,
-        "NIP": 5,
-        "INVOICE_ID": 6,
-        "PHONE": 7,
-        "COMPANY": 8,
-    }
-    return priorities.get(label, 99)
 
 
 def _unique_destination(destination: Path, used_destinations: set[Path]) -> Path:
@@ -557,7 +539,8 @@ def _remove_unsupported_ooxml_parts(path: Path) -> bool:
                 cleaned = re.sub(
                     rb"<Relationship\b(?=[^>]*(?:/drawing|/image|/oleObject|/package|"
                     rb"/printerSettings|customXml|media/|embeddings/|charts/|chartsheets/|"
-                    rb"/chart|/table|tables/|pivotCache|pivotTables?/))[^>]*/>",
+                    rb"/chart|/table|tables/|pivotCache|pivotTables?/|vbaProject|activeX|"
+                    rb"ctrlProps/))[^>]*/>",
                     b"",
                     data,
                 )
@@ -583,20 +566,7 @@ def _remove_unsupported_ooxml_parts(path: Path) -> bool:
 
 
 def _is_unsupported_ooxml_part(name: str) -> bool:
-    return name.startswith(
-        (
-            "xl/chartsheets/",
-            "xl/media/",
-            "xl/drawings/",
-            "xl/charts/",
-            "xl/embeddings/",
-            "xl/pivotCache/",
-            "xl/pivotTables/",
-            "xl/printerSettings/",
-            "xl/tables/",
-            "customXml/",
-        )
-    )
+    return name in UNSUPPORTED_OOXML_PART_NAMES or name.startswith(UNSUPPORTED_OOXML_PART_PREFIXES)
 
 
 def _unsupported_workbook_relationship_ids(source: zipfile.ZipFile) -> set[bytes]:
@@ -621,7 +591,8 @@ def _remove_unsupported_ooxml_references(
     if name == "[Content_Types].xml":
         return re.sub(
             rb"<Override\b(?=[^>]*PartName=\"/(?:xl/(?:chartsheets|media|drawings|charts|embeddings|"
-            rb"pivotCache|pivotTables|printerSettings|tables)/|customXml/))[^>]*/>",
+            rb"pivotCache|pivotTables|printerSettings|tables|activeX|ctrlProps)/|"
+            rb"xl/vbaProject(?:Signature)?\.bin|customXml/))[^>]*/>",
             b"",
             data,
         )
