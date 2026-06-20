@@ -2520,6 +2520,24 @@ def test_package_tokenizes_generic_contact_names(tmp_path: Path) -> None:
     assert validate_output(output_dir).passed
 
 
+def test_package_redacts_short_driver_note_with_name_and_phone(tmp_path: Path) -> None:
+    input_dir = tmp_path / "input"
+    output_dir = tmp_path / "codex-safe"
+    input_dir.mkdir()
+    workbook = Workbook()
+    worksheet = workbook.active
+    worksheet.append(["Status"])
+    worksheet.append(["Kierowca: Stanis\u0142aw +48503904261 60+1"])
+    workbook.save(input_dir / "drivers.xlsx")
+
+    result = package_directory(input_dir, output_dir)
+
+    assert result.passed
+    sanitized = load_workbook(output_dir / "sanitized" / "drivers.xlsx", data_only=False)
+    assert sanitized.active["A2"].value == "[REDACTED_TEXT]"
+    assert validate_output(output_dir).passed
+
+
 def test_validator_recognizes_generated_tokens_as_safe() -> None:
     assert _is_safe_generated_value("SPREADSAFE_EMAIL_0001")
     assert _is_safe_generated_value("SPREADSAFE_PHONE_0001")

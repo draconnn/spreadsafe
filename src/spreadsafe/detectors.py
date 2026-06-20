@@ -353,4 +353,4 @@ def _looks_like_safe_enum(value: str) -> bool:
 def _is_free_text(column_name: str, value: str, detections: tuple[Detection, ...]) -> bool:
     if any(term in column_name for term in ("note", "comment", "opis", "uwagi")) and detections:
         return True
-    return len(value.split()) >= 5 and len(detections) >= 2
+    return len(detections) >= 2 and (len(value.split()) >= 5 or ":" in value)
