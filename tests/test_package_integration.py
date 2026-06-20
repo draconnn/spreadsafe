@@ -1,4 +1,4 @@
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 import json
 import zipfile
@@ -13,11 +13,12 @@ from openpyxl.worksheet.datavalidation import DataValidation
 import pytest
 from typer.testing import CliRunner
 
+from spreadsafe import cli as cli_module
 from spreadsafe.cli import app, package_directory
 from spreadsafe.detectors import Config, load_config
 from spreadsafe.mapping import PseudonymMapper
 from spreadsafe.sanitizer import Sanitizer, _parse_decimal
-from spreadsafe.validators import _is_safe_generated_value, validate_output
+from spreadsafe.validators import ValidationResult, _is_safe_generated_value, validate_output
 
 
 def make_workbook(path: Path) -> None:
@@ -106,7 +107,8 @@ def test_validation_fails_when_obvious_pii_remains(tmp_path: Path) -> None:
     result = validate_output(output_dir)
 
     assert not result.passed
-    assert any("jan@example.com" in issue for issue in result.issues)
+    assert any("leak.csv: row 2 column 1 EMAIL remains" in issue for issue in result.issues)
+    assert all("jan@example.com" not in issue for issue in result.issues)
 
 
 def test_validate_command_returns_failure_exit_code_for_leaks(tmp_path: Path) -> None:
@@ -119,7 +121,8 @@ def test_validate_command_returns_failure_exit_code_for_leaks(tmp_path: Path) ->
     result = runner.invoke(app, ["validate", str(output_dir)])
 
     assert result.exit_code == 1
-    assert "jan@example.com" in result.stderr
+    assert "leak.csv: row 2 column 1 EMAIL remains" in result.stderr
+    assert "jan@example.com" not in result.stderr
 
 
 def test_validate_command_reports_success_for_clean_package(tmp_path: Path) -> None:
@@ -133,6 +136,16 @@ def test_validate_command_reports_success_for_clean_package(tmp_path: Path) -> N
 
     assert result.exit_code == 0
     assert "Validation passed" in result.stdout
+
+
+def test_cli_help_lists_commands() -> None:
+    runner = CliRunner()
+
+    result = runner.invoke(app, ["--help"])
+
+    assert result.exit_code == 0
+    for command in ("scan", "sanitize", "validate", "package"):
+        assert command in result.stdout
 
 
 def test_validate_command_applies_config_file(tmp_path: Path) -> None:
@@ -163,6 +176,30 @@ def test_existing_output_gitignore_is_preserved_without_state_directory(tmp_path
     gitignore_lines = (output_dir / ".gitignore").read_text(encoding="utf-8").splitlines()
     assert gitignore_lines == ["reports/tmp/"]
     assert not (output_dir / "state").exists()
+
+
+def test_package_rejects_sensitive_existing_output_gitignore(tmp_path: Path) -> None:
+    input_dir = tmp_path / "input"
+    output_dir = tmp_path / "codex-safe"
+    input_dir.mkdir()
+    output_dir.mkdir()
+    make_workbook(input_dir / "orders.xlsx")
+    (output_dir / ".gitignore").write_text("jan@example.com\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="Existing output .gitignore contains sensitive data"):
+        package_directory(input_dir, output_dir)
+
+
+def test_package_rejects_existing_output_gitignore_directory(tmp_path: Path) -> None:
+    input_dir = tmp_path / "input"
+    output_dir = tmp_path / "codex-safe"
+    input_dir.mkdir()
+    output_dir.mkdir()
+    make_workbook(input_dir / "orders.xlsx")
+    (output_dir / ".gitignore").mkdir()
+
+    with pytest.raises(ValueError, match="Existing output .gitignore is not a file"):
+        package_directory(input_dir, output_dir)
 
 
 def test_package_removes_xlsx_comments_and_hyperlinks(tmp_path: Path) -> None:
@@ -864,6 +901,54 @@ def test_sanitize_command_clears_stale_sanitized_files(tmp_path: Path) -> None:
     assert (stale_sanitized / "orders.xlsx").exists()
 
 
+def test_sanitize_command_exits_on_validation_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    input_dir = tmp_path / "input"
+    output_dir = tmp_path / "codex-safe"
+    input_dir.mkdir()
+    (input_dir / "safe.csv").write_text("status\nACTIVE\n", encoding="utf-8")
+    runner = CliRunner()
+
+    def fail_validation(*_args: object, **_kwargs: object) -> ValidationResult:
+        return ValidationResult(False, issues=["redacted validation issue"])
+
+    monkeypatch.setattr("spreadsafe.cli.validate_output", fail_validation)
+
+    result = runner.invoke(app, ["sanitize", str(input_dir), "--out", str(output_dir)])
+
+    assert result.exit_code == 1
+    assert "redacted validation issue" in result.stderr
+    assert "Wrote sanitized files" not in result.stdout
+
+
+def test_sanitize_validation_failure_preserves_existing_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    input_dir = tmp_path / "input"
+    output_dir = tmp_path / "codex-safe"
+    old_sanitized = output_dir / "sanitized"
+    input_dir.mkdir()
+    old_sanitized.mkdir(parents=True)
+    (input_dir / "new.csv").write_text("status\nNEW\n", encoding="utf-8")
+    (old_sanitized / "old.csv").write_text("status\nOLD\n", encoding="utf-8")
+    (output_dir / ".spreadsafe-package").write_text("spreadsafe\n", encoding="utf-8")
+    runner = CliRunner()
+
+    def fail_validation(*_args: object, **_kwargs: object) -> ValidationResult:
+        return ValidationResult(False, issues=["redacted validation issue"])
+
+    monkeypatch.setattr("spreadsafe.cli.validate_output", fail_validation)
+
+    result = runner.invoke(app, ["sanitize", str(input_dir), "--out", str(output_dir)])
+
+    assert result.exit_code == 1
+    assert (old_sanitized / "old.csv").exists()
+    assert not (old_sanitized / "new.csv").exists()
+
+
 def test_scan_and_sanitize_clear_stale_sibling_outputs(tmp_path: Path) -> None:
     input_dir = tmp_path / "input"
     output_dir = tmp_path / "codex-safe"
@@ -1143,6 +1228,74 @@ def test_package_command_refuses_to_clear_unmarked_generated_output(
     assert stale_file.exists()
 
 
+def test_package_directory_validation_failure_preserves_existing_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    input_dir = tmp_path / "input"
+    output_dir = tmp_path / "codex-safe"
+    old_sanitized = output_dir / "sanitized"
+    old_reports = output_dir / "reports"
+    input_dir.mkdir()
+    old_sanitized.mkdir(parents=True)
+    old_reports.mkdir()
+    make_workbook(input_dir / "orders.xlsx")
+    (old_sanitized / "old.csv").write_text("status\nOLD\n", encoding="utf-8")
+    (old_reports / "old.md").write_text("old report\n", encoding="utf-8")
+    (output_dir / ".spreadsafe-package").write_text("spreadsafe\n", encoding="utf-8")
+
+    def fail_validation(*_args: object, **_kwargs: object) -> ValidationResult:
+        return ValidationResult(False, issues=["redacted validation issue"])
+
+    monkeypatch.setattr("spreadsafe.cli.validate_output", fail_validation)
+
+    result = package_directory(input_dir, output_dir)
+
+    assert not result.passed
+    assert (old_sanitized / "old.csv").exists()
+    assert not (old_sanitized / "orders.xlsx").exists()
+    assert (old_reports / "old.md").exists()
+
+
+def test_replace_generated_output_restores_existing_output_on_move_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output_dir = tmp_path / "codex-safe"
+    staged_output = tmp_path / ".codex-safe-staged"
+    (output_dir / "sanitized").mkdir(parents=True)
+    (output_dir / "reports").mkdir()
+    (staged_output / "sanitized").mkdir(parents=True)
+    (staged_output / "reports").mkdir()
+    (output_dir / "sanitized" / "old.csv").write_text("status\nOLD\n", encoding="utf-8")
+    (output_dir / "reports" / "old.md").write_text("old report\n", encoding="utf-8")
+    (output_dir / ".spreadsafe-package").write_text("spreadsafe\n", encoding="utf-8")
+    (staged_output / "sanitized" / "new.csv").write_text("status\nNEW\n", encoding="utf-8")
+    (staged_output / "reports" / "new.md").write_text("new report\n", encoding="utf-8")
+    (staged_output / ".spreadsafe-package").write_text("spreadsafe\n", encoding="utf-8")
+    real_replace = cli_module._replace_path
+
+    def fail_on_reports(source: Path, destination: Path) -> None:
+        if source.parent == staged_output and source.name == "reports":
+            destination.mkdir()
+            raise OSError("move failed")
+        real_replace(source, destination)
+
+    monkeypatch.setattr(cli_module, "_replace_path", fail_on_reports)
+
+    with pytest.raises(OSError, match="move failed"):
+        cli_module._replace_generated_output(
+            staged_output,
+            output_dir,
+            ("sanitized", "reports", ".spreadsafe-package"),
+        )
+
+    assert (output_dir / "sanitized" / "old.csv").exists()
+    assert (output_dir / "reports" / "old.md").exists()
+    assert (output_dir / ".spreadsafe-package").read_text(encoding="utf-8") == "spreadsafe\n"
+    assert not any(path.name.endswith("backup") for path in output_dir.iterdir())
+
+
 def test_package_command_rejects_existing_output_file_without_traceback(tmp_path: Path) -> None:
     input_dir = tmp_path / "input"
     output_path = tmp_path / "codex-safe"
@@ -1203,6 +1356,49 @@ def test_validate_rejects_unexpected_package_root_files(tmp_path: Path) -> None:
 
     assert not result.passed
     assert any("Unexpected package root entry" in issue for issue in result.issues)
+
+
+def test_validate_rejects_reports_path_that_is_not_directory(tmp_path: Path) -> None:
+    output_dir = tmp_path / "codex-safe"
+    sanitized_dir = output_dir / "sanitized"
+    sanitized_dir.mkdir(parents=True)
+    (sanitized_dir / "safe.csv").write_text("status\nACTIVE\n", encoding="utf-8")
+    (output_dir / "reports").write_text("email\njan@example.com\n", encoding="utf-8")
+
+    result = validate_output(output_dir)
+
+    assert not result.passed
+    assert any("Package reports path is not a directory" in issue for issue in result.issues)
+
+
+def test_validate_rejects_unexpected_report_payloads(tmp_path: Path) -> None:
+    output_dir = tmp_path / "codex-safe"
+    sanitized_dir = output_dir / "sanitized"
+    reports_dir = output_dir / "reports"
+    sanitized_dir.mkdir(parents=True)
+    reports_dir.mkdir()
+    (sanitized_dir / "safe.csv").write_text("status\nACTIVE\n", encoding="utf-8")
+    (reports_dir / "jan@example.com.xlsx").write_bytes(b"not inspected")
+
+    result = validate_output(output_dir)
+
+    assert not result.passed
+    assert any("Unexpected report file type" in issue for issue in result.issues)
+    assert any("reports/[EMAIL]" in issue for issue in result.issues)
+    assert all("jan@example.com" not in issue for issue in result.issues)
+
+
+def test_validate_rejects_invalid_package_marker_content(tmp_path: Path) -> None:
+    output_dir = tmp_path / "codex-safe"
+    sanitized_dir = output_dir / "sanitized"
+    sanitized_dir.mkdir(parents=True)
+    (sanitized_dir / "safe.csv").write_text("status\nACTIVE\n", encoding="utf-8")
+    (output_dir / ".spreadsafe-package").write_text("email\njan@example.com\n", encoding="utf-8")
+
+    result = validate_output(output_dir)
+
+    assert not result.passed
+    assert any("Package marker content is invalid" in issue for issue in result.issues)
 
 
 def test_validate_rejects_symlinked_directories_under_sanitized(tmp_path: Path) -> None:
@@ -1339,6 +1535,23 @@ def test_validate_rejects_sensitive_filenames_and_sheet_titles(tmp_path: Path) -
     assert not result.passed
     assert any("path contains" in issue for issue in result.issues)
     assert any("sheet title contains" in issue for issue in result.issues)
+    assert all("jan@example.com" not in issue for issue in result.issues)
+
+
+def test_validate_redacts_sensitive_xlsx_filename_locations(tmp_path: Path) -> None:
+    output_dir = tmp_path / "codex-safe"
+    sanitized_dir = output_dir / "sanitized"
+    sanitized_dir.mkdir(parents=True)
+    workbook = Workbook()
+    workbook.active.append(["Email"])
+    workbook.active.append(["jan@example.com"])
+    workbook.save(sanitized_dir / "Jan Kowalski.xlsx")
+
+    result = validate_output(output_dir)
+
+    assert not result.passed
+    assert any("[PERSON].xlsx" in issue for issue in result.issues)
+    assert all("Jan Kowalski" not in issue for issue in result.issues)
 
 
 def test_package_removes_sensitive_xlsx_data_validations(tmp_path: Path) -> None:
@@ -1439,6 +1652,8 @@ def test_package_clears_sensitive_xlsx_document_properties(tmp_path: Path) -> No
     workbook.properties.creator = "jan@example.com"
     workbook.properties.lastModifiedBy = "Jan Kowalski"
     workbook.properties.title = "Customer jan@example.com"
+    workbook.properties.created = datetime(1999, 12, 31, 23, 59, 58)
+    workbook.properties.modified = datetime(2001, 1, 2, 3, 4, 5)
     workbook.active.append(["Status"])
     workbook.active.append(["ACTIVE"])
     workbook.save(input_dir / "metadata.xlsx")
@@ -1450,6 +1665,12 @@ def test_package_clears_sensitive_xlsx_document_properties(tmp_path: Path) -> No
     assert sanitized.properties.creator == "spreadsafe"
     assert sanitized.properties.lastModifiedBy == "spreadsafe"
     assert sanitized.properties.title is None
+    assert sanitized.properties.created == datetime(2000, 1, 1)
+    assert sanitized.properties.modified == datetime(2000, 1, 1)
+    with zipfile.ZipFile(output_dir / "sanitized" / "metadata.xlsx") as workbook_zip:
+        core_xml = workbook_zip.read("docProps/core.xml").decode()
+    assert "1999-12-31" not in core_xml
+    assert "2001-01-02" not in core_xml
     assert validate_output(output_dir).passed
 
 
@@ -1525,6 +1746,23 @@ def test_validate_rejects_sensitive_xlsx_document_properties(tmp_path: Path) -> 
     assert any("document property creator contains EMAIL" in issue for issue in result.issues)
 
 
+def test_validate_rejects_unnormalized_xlsx_document_timestamps(tmp_path: Path) -> None:
+    output_dir = tmp_path / "codex-safe"
+    sanitized_dir = output_dir / "sanitized"
+    sanitized_dir.mkdir(parents=True)
+    workbook = Workbook()
+    workbook.properties.created = datetime(1999, 12, 31, 23, 59, 58)
+    workbook.properties.modified = datetime(2001, 1, 2, 3, 4, 5)
+    workbook.active.append(["Status"])
+    workbook.save(sanitized_dir / "metadata.xlsx")
+
+    result = validate_output(output_dir)
+
+    assert not result.passed
+    assert any("document property created is not normalized" in issue for issue in result.issues)
+    assert any("document property modified is not normalized" in issue for issue in result.issues)
+
+
 def test_validate_rejects_sensitive_xlsx_custom_document_properties(tmp_path: Path) -> None:
     output_dir = tmp_path / "codex-safe"
     sanitized_dir = output_dir / "sanitized"
@@ -1538,6 +1776,22 @@ def test_validate_rejects_sensitive_xlsx_custom_document_properties(tmp_path: Pa
 
     assert not result.passed
     assert any("custom document property Contact contains EMAIL" in issue for issue in result.issues)
+
+
+def test_validate_redacts_sensitive_xlsx_custom_document_property_names(tmp_path: Path) -> None:
+    output_dir = tmp_path / "codex-safe"
+    sanitized_dir = output_dir / "sanitized"
+    sanitized_dir.mkdir(parents=True)
+    workbook = Workbook()
+    workbook.active.append(["Status"])
+    workbook.custom_doc_props.append(StringProperty(name="jan@example.com", value="safe"))
+    workbook.save(sanitized_dir / "custom-metadata.xlsx")
+
+    result = validate_output(output_dir)
+
+    assert not result.passed
+    assert any("custom document property [EMAIL] contains EMAIL" in issue for issue in result.issues)
+    assert all("jan@example.com" not in issue for issue in result.issues)
 
 
 def test_validate_rejects_sensitive_xlsx_headers_and_footers(tmp_path: Path) -> None:
@@ -1568,6 +1822,22 @@ def test_validate_rejects_sensitive_xlsx_defined_names(tmp_path: Path) -> None:
 
     assert not result.passed
     assert any("defined name ContactEmail contains EMAIL" in issue for issue in result.issues)
+
+
+def test_validate_redacts_sensitive_xlsx_defined_names(tmp_path: Path) -> None:
+    output_dir = tmp_path / "codex-safe"
+    sanitized_dir = output_dir / "sanitized"
+    sanitized_dir.mkdir(parents=True)
+    workbook = Workbook()
+    workbook.active.append(["Status"])
+    workbook.defined_names.add(DefinedName("jan@example.com", attr_text='"safe"'))
+    workbook.save(sanitized_dir / "defined-names.xlsx")
+
+    result = validate_output(output_dir)
+
+    assert not result.passed
+    assert any("defined name [EMAIL] contains EMAIL" in issue for issue in result.issues)
+    assert all("jan@example.com" not in issue for issue in result.issues)
 
 
 def test_validate_rejects_numeric_xlsx_identifiers(tmp_path: Path) -> None:
@@ -1622,6 +1892,84 @@ def test_validate_rejects_sensitive_xlsx_data_validation_messages(tmp_path: Path
 
     assert not result.passed
     assert any("data validation contains EMAIL" in issue for issue in result.issues)
+
+
+def test_package_removes_sensitive_xlsx_auto_filter_values(tmp_path: Path) -> None:
+    input_dir = tmp_path / "input"
+    output_dir = tmp_path / "codex-safe"
+    input_dir.mkdir()
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.append(["Email"])
+    sheet.append(["jan@example.com"])
+    sheet.auto_filter.ref = "A1:A2"
+    sheet.auto_filter.add_filter_column(0, ["jan@example.com"])
+    workbook.save(input_dir / "filters.xlsx")
+
+    result = package_directory(input_dir, output_dir)
+
+    assert result.passed
+    sanitized_path = output_dir / "sanitized" / "filters.xlsx"
+    with zipfile.ZipFile(sanitized_path) as workbook_zip:
+        worksheet_xml = workbook_zip.read("xl/worksheets/sheet1.xml").decode()
+    assert "jan@example.com" not in worksheet_xml
+    assert "autoFilter" not in worksheet_xml
+    assert validate_output(output_dir).passed
+
+
+def test_package_removes_xlsx_chartsheets(tmp_path: Path) -> None:
+    input_dir = tmp_path / "input"
+    output_dir = tmp_path / "codex-safe"
+    input_dir.mkdir()
+    workbook = Workbook()
+    workbook.active.append(["Status"])
+    workbook.create_chartsheet("jan@example.com")
+    workbook.save(input_dir / "chartsheets.xlsx")
+
+    result = package_directory(input_dir, output_dir)
+
+    assert result.passed
+    sanitized_path = output_dir / "sanitized" / "chartsheets.xlsx"
+    with zipfile.ZipFile(sanitized_path) as workbook_zip:
+        names = workbook_zip.namelist()
+        workbook_xml = workbook_zip.read("xl/workbook.xml").decode()
+    assert not any(name.startswith("xl/chartsheets/") for name in names)
+    assert "jan@example.com" not in workbook_xml
+    assert validate_output(output_dir).passed
+
+
+def test_validate_rejects_xlsx_chartsheets(tmp_path: Path) -> None:
+    output_dir = tmp_path / "codex-safe"
+    sanitized_dir = output_dir / "sanitized"
+    sanitized_dir.mkdir(parents=True)
+    workbook = Workbook()
+    workbook.active.append(["Status"])
+    workbook.create_chartsheet("jan@example.com")
+    workbook.save(sanitized_dir / "chartsheets.xlsx")
+
+    result = validate_output(output_dir)
+
+    assert not result.passed
+    assert any("unsupported workbook payload remains" in issue for issue in result.issues)
+
+
+def test_validate_rejects_sensitive_xlsx_auto_filter_values(tmp_path: Path) -> None:
+    output_dir = tmp_path / "codex-safe"
+    sanitized_dir = output_dir / "sanitized"
+    sanitized_dir.mkdir(parents=True)
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.append(["Email"])
+    sheet.append(["EMAIL 0001"])
+    sheet.auto_filter.ref = "A1:A2"
+    sheet.auto_filter.add_filter_column(0, ["jan@example.com"])
+    workbook.save(sanitized_dir / "filters.xlsx")
+
+    result = validate_output(output_dir)
+
+    assert not result.passed
+    assert any("auto filter contains EMAIL" in issue for issue in result.issues)
+    assert all("jan@example.com" not in issue for issue in result.issues)
 
 
 def test_validate_rejects_external_xlsx_data_validations(tmp_path: Path) -> None:

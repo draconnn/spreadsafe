@@ -36,6 +36,13 @@ def test_amounts_keep_sign_and_change_value() -> None:
     assert 10000 < abs(negative) < 20000
 
 
+def test_tiny_amounts_do_not_round_to_zero() -> None:
+    mapper = PseudonymMapper(seed="fixture")
+
+    assert mapper.perturb_amount(0.004) > 0
+    assert mapper.perturb_amount(-0.004) < 0
+
+
 def test_amount_perturbation_never_uses_noop_multiplier() -> None:
     assert PseudonymMapper(seed="spreadsafe").perturb_amount(17) != 17.0
     assert PseudonymMapper(seed="fixture").perturb_amount(26) != 26.0

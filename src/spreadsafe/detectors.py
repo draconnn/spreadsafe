@@ -199,7 +199,6 @@ class Detector:
                     entities=["PERSON", "EMAIL_ADDRESS", "PHONE_NUMBER", "IBAN_CODE"],
                 )
             except Exception:
-                Detector._presidio_failed_locales.add(locale)
                 continue
             break
         else:

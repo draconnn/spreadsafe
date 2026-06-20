@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 import csv
 import re
@@ -9,7 +10,7 @@ import zipfile
 
 from openpyxl import load_workbook
 
-from spreadsafe.detectors import Config, Detector, load_config
+from spreadsafe.detectors import Config, Detection, Detector, load_config
 from spreadsafe.sanitizer import (
     _data_validation_has_external_reference,
     _data_validation_text,
@@ -22,6 +23,7 @@ from spreadsafe.sanitizer import (
 )
 
 ALLOWED_PACKAGE_ROOT_ENTRIES = {".gitignore", ".spreadsafe-package", "reports", "sanitized"}
+SAFE_DOCUMENT_TIMESTAMP = datetime(2000, 1, 1)
 
 
 @dataclass
@@ -36,26 +38,32 @@ def validate_output(output_dir: Path, config: Config | None = None) -> Validatio
     issues: list[str] = []
     warnings: list[str] = []
     detector = Detector(config or load_config(None))
+    output_location = _validation_location(output_dir.as_posix(), detector)
+    sanitized_location = _validation_location(sanitized_dir.as_posix(), detector)
     if output_dir.is_symlink():
-        issues.append(f"Package directory is a symlink: {output_dir}")
+        issues.append(f"Package directory is a symlink: {output_location}")
     if output_dir.exists() and output_dir.is_dir():
         _validate_package_root(output_dir, detector, issues)
     if sanitized_dir.is_symlink():
-        issues.append(f"Sanitized directory is a symlink: {sanitized_dir}")
+        issues.append(f"Sanitized directory is a symlink: {sanitized_location}")
         return ValidationResult(False, issues, warnings)
     if not sanitized_dir.exists():
-        issues.append(f"Missing sanitized directory: {sanitized_dir}")
+        issues.append(f"Missing sanitized directory: {sanitized_location}")
         return ValidationResult(False, issues, warnings)
     if not sanitized_dir.is_dir():
-        issues.append(f"Sanitized path is not a directory: {sanitized_dir}")
+        issues.append(f"Sanitized path is not a directory: {sanitized_location}")
         return ValidationResult(False, issues, warnings)
     state_dir = output_dir / "state"
     if state_dir.exists():
-        issues.append(f"Package contains local re-identification state: {state_dir}")
+        issues.append(
+            "Package contains local re-identification state: "
+            f"{_validation_location(state_dir.relative_to(output_dir).as_posix(), detector)}"
+        )
 
     for file_path in sorted(sanitized_dir.rglob("*")):
+        package_location = _validation_location(file_path.relative_to(output_dir).as_posix(), detector)
         if file_path.is_symlink():
-            issues.append(f"Symlink is not allowed in sanitized package: {file_path}")
+            issues.append(f"Symlink is not allowed in sanitized package: {package_location}")
             continue
         if file_path.is_dir():
             continue
@@ -63,40 +71,53 @@ def validate_output(output_dir: Path, config: Config | None = None) -> Validatio
         if file_path.suffix.lower() == ".xlsx":
             _validate_xlsx(file_path, detector, issues, warnings)
         elif file_path.suffix.lower() == ".csv":
-            _validate_csv_formulas(file_path, issues)
+            _validate_csv_formulas(file_path, detector, issues)
             _validate_csv_values(file_path, detector, issues)
         else:
-            issues.append(f"Unexpected sanitized file type: {file_path}")
+            issues.append(f"Unexpected sanitized file type: {package_location}")
     reports_dir = output_dir / "reports"
+    reports_location = _validation_location(reports_dir.as_posix(), detector)
     if reports_dir.exists():
         if reports_dir.is_symlink():
-            issues.append(f"Reports directory is a symlink: {reports_dir}")
+            issues.append(f"Reports directory is a symlink: {reports_location}")
             return ValidationResult(False, issues, warnings)
-        for file_path in sorted(reports_dir.rglob("*")):
-            if file_path.is_symlink():
-                issues.append(f"Symlink is not allowed in reports: {file_path}")
-                continue
-            if file_path.is_file() and file_path.suffix.lower() in {".md", ".json", ".csv", ".txt"}:
-                _validate_text_file(file_path, detector, issues)
+        if reports_dir.is_dir():
+            for file_path in sorted(reports_dir.rglob("*")):
+                report_location = _validation_location(file_path.relative_to(output_dir).as_posix(), detector)
+                if file_path.is_symlink():
+                    issues.append(f"Symlink is not allowed in reports: {report_location}")
+                    continue
+                if file_path.is_dir():
+                    issues.append(f"Unexpected reports directory: {report_location}")
+                    continue
+                if file_path.suffix.lower() in {".md", ".json", ".csv", ".txt"}:
+                    _validate_text_file(file_path, detector, issues)
+                else:
+                    issues.append(f"Unexpected report file type: {report_location}")
     return ValidationResult(not issues, issues, warnings)
 
 
 def _validate_package_root(output_dir: Path, detector: Detector, issues: list[str]) -> None:
     for child in sorted(output_dir.iterdir()):
+        child_location = _validation_location(child.relative_to(output_dir).as_posix(), detector)
         if child.name not in ALLOWED_PACKAGE_ROOT_ENTRIES:
-            issues.append(f"Unexpected package root entry: {child}")
+            issues.append(f"Unexpected package root entry: {child_location}")
             continue
         if child.is_symlink():
-            issues.append(f"Symlink is not allowed in package root: {child}")
+            issues.append(f"Symlink is not allowed in package root: {child_location}")
             continue
         if child.name == ".gitignore":
             if child.is_file():
                 _validate_text_file(child, detector, issues)
             else:
-                issues.append(f"Package .gitignore is not a file: {child}")
+                issues.append(f"Package .gitignore is not a file: {child_location}")
         elif child.name == ".spreadsafe-package":
             if not child.is_file():
-                issues.append(f"Package marker is not a file: {child}")
+                issues.append(f"Package marker is not a file: {child_location}")
+            elif child.read_text(encoding="utf-8", errors="ignore") != "spreadsafe\n":
+                issues.append(f"Package marker content is invalid: {child_location}")
+        elif child.name == "reports" and not child.is_dir():
+            issues.append(f"Package reports path is not a directory: {child_location}")
 
 
 def _validate_xlsx(
@@ -105,28 +126,38 @@ def _validate_xlsx(
     issues: list[str],
     warnings: list[str],
 ) -> None:
+    workbook_name = _validation_location(file_path.name, detector)
     for part_name in _external_link_part_names(file_path):
-        issues.append(f"{file_path.name}: external workbook link metadata remains: {part_name}")
-    for part_name in _unsupported_ooxml_part_names(file_path):
-        issues.append(f"{file_path.name}: unsupported workbook payload remains: {part_name}")
+        issues.append(f"{workbook_name}: external workbook link metadata remains: {part_name}")
+    unsupported_part_names = _unsupported_ooxml_part_names(file_path)
+    for part_name in unsupported_part_names:
+        issues.append(f"{workbook_name}: unsupported workbook payload remains: {part_name}")
+    if unsupported_part_names:
+        return
     workbook = load_workbook(file_path, data_only=False)
     for field_name, value in _document_property_values(workbook).items():
         for detection in detector.detect_text(value):
             if _is_safe_generated_value(detection.value):
                 continue
             issues.append(
-                f"{file_path.name}: document property {field_name} contains "
-                f"{detection.label}: {detection.value}"
+                f"{workbook_name}: document property {field_name} contains "
+                f"{_validation_issue_label(detection)}"
             )
+    for field_name in ("created", "modified"):
+        timestamp_value = getattr(workbook.properties, field_name, None)
+        if isinstance(timestamp_value, datetime) and timestamp_value != SAFE_DOCUMENT_TIMESTAMP:
+            issues.append(f"{workbook_name}: document property {field_name} is not normalized")
     for property_name, value in _custom_document_property_values(workbook).items():
+        property_location = _validation_location(property_name, detector)
         for detection in detector.detect_text(value):
             if _is_safe_generated_value(detection.value):
                 continue
             issues.append(
-                f"{file_path.name}: custom document property {property_name} contains "
-                f"{detection.label}: {detection.value}"
+                f"{workbook_name}: custom document property {property_location} contains "
+                f"{_validation_issue_label(detection)}"
             )
     for name, defined_name in workbook.defined_names.items():
+        name_location = _validation_location(name, detector)
         defined_text = " ".join(
             str(value)
             for value in (name, defined_name.attr_text, defined_name.comment, defined_name.description)
@@ -136,36 +167,37 @@ def _validate_xlsx(
             if _is_safe_generated_value(detection.value):
                 continue
             issues.append(
-                f"{file_path.name}: defined name {name} contains "
-                f"{detection.label}: {detection.value}"
+                f"{workbook_name}: defined name {name_location} contains "
+                f"{_validation_issue_label(detection)}"
             )
     for worksheet in workbook.worksheets:
+        worksheet_name = _validation_location(worksheet.title, detector)
         headers = [str(cell.value or f"Column {cell.column}") for cell in worksheet[1]]
         for column_index, header in enumerate(headers, start=1):
             if _csv_header_is_sensitive(detector, header):
                 issues.append(
-                    f"{file_path.name}:{worksheet.title}: row 1 column {column_index} "
+                    f"{workbook_name}:{worksheet_name}: row 1 column {column_index} "
                     "contains sensitive header"
                 )
         for detection in detector.detect_text(worksheet.title):
             issues.append(
-                f"{file_path.name}:{worksheet.title}: sheet title contains "
-                f"{detection.label}: {detection.value}"
+                f"{workbook_name}:{worksheet_name}: sheet title contains "
+                f"{_validation_issue_label(detection)}"
             )
         for location, value in _worksheet_header_footer_values(worksheet).items():
             for detection in detector.detect_text(value):
                 if _is_safe_generated_value(detection.value):
                     continue
                 issues.append(
-                    f"{file_path.name}:{worksheet.title}: {location} contains "
-                    f"{detection.label}: {detection.value}"
+                    f"{workbook_name}:{worksheet_name}: {location} contains "
+                    f"{_validation_issue_label(detection)}"
                 )
         if worksheet.sheet_state != "visible":
-            warnings.append(f"{file_path.name}:{worksheet.title}: hidden sheet requires manual review")
+            warnings.append(f"{workbook_name}:{worksheet_name}: hidden sheet requires manual review")
         for validation in worksheet.data_validations.dataValidation:
             if _data_validation_has_external_reference(validation):
                 issues.append(
-                    f"{file_path.name}:{worksheet.title}: "
+                    f"{workbook_name}:{worksheet_name}: "
                     "data validation contains external workbook reference"
                 )
             validation_text = _data_validation_text(validation)
@@ -173,21 +205,28 @@ def _validate_xlsx(
                 if _is_safe_generated_value(detection.value):
                     continue
                 issues.append(
-                    f"{file_path.name}:{worksheet.title}: data validation contains "
-                    f"{detection.label}: {detection.value}"
+                    f"{workbook_name}:{worksheet_name}: data validation contains "
+                    f"{_validation_issue_label(detection)}"
                 )
+        for detection in detector.detect_text(_auto_filter_text(worksheet)):
+            if _is_safe_generated_value(detection.value):
+                continue
+            issues.append(
+                f"{workbook_name}:{worksheet_name}: auto filter contains "
+                f"{_validation_issue_label(detection)}"
+            )
         for row in worksheet.iter_rows():
             for cell in row:
                 if cell.comment is not None:
-                    issues.append(f"{file_path.name}:{worksheet.title}:{cell.coordinate}: comment remains")
+                    issues.append(f"{workbook_name}:{worksheet_name}:{cell.coordinate}: comment remains")
                 if cell.hyperlink is not None:
-                    issues.append(f"{file_path.name}:{worksheet.title}:{cell.coordinate}: hyperlink remains")
+                    issues.append(f"{workbook_name}:{worksheet_name}:{cell.coordinate}: hyperlink remains")
                 value = cell.value
                 if not isinstance(value, str):
                     header = headers[cell.column - 1] if cell.column - 1 < len(headers) else ""
                     if _value_violates_config_sensitive(detector, header, value):
                         issues.append(
-                            f"{file_path.name}:{worksheet.title}:{cell.coordinate}: "
+                            f"{workbook_name}:{worksheet_name}:{cell.coordinate}: "
                             "configured sensitive value remains"
                         )
                         continue
@@ -198,34 +237,34 @@ def _validate_xlsx(
                             if _is_safe_generated_value(detection.value):
                                 continue
                             issues.append(
-                                f"{file_path.name}:{worksheet.title}:{cell.coordinate}: "
-                                f"{detection.label} remains: {detection.value}"
+                                f"{workbook_name}:{worksheet_name}:{cell.coordinate}: "
+                                f"{_validation_issue_label(detection)} remains"
                             )
                     continue
                 if value.startswith("="):
                     header = headers[cell.column - 1] if cell.column - 1 < len(headers) else ""
                     if _formula_is_in_sensitive_column(detector, header):
                         issues.append(
-                            f"{file_path.name}:{worksheet.title}:{cell.coordinate}: "
+                            f"{workbook_name}:{worksheet_name}:{cell.coordinate}: "
                             "formula remains in sensitive column"
                         )
                     if _looks_like_external_formula(value):
                         issues.append(
-                            f"{file_path.name}:{worksheet.title}:{cell.coordinate}: "
+                            f"{workbook_name}:{worksheet_name}:{cell.coordinate}: "
                             "formula contains external workbook reference"
                         )
                     for detection in detector.detect_text(value):
                         if _is_safe_generated_value(detection.value):
                             continue
                         issues.append(
-                            f"{file_path.name}:{worksheet.title}:{cell.coordinate}: "
-                            f"formula contains {detection.label}: {detection.value}"
+                            f"{workbook_name}:{worksheet_name}:{cell.coordinate}: "
+                            f"formula contains {_validation_issue_label(detection)}"
                         )
                     continue
                 header = headers[cell.column - 1] if cell.column - 1 < len(headers) else ""
                 if _value_violates_config_sensitive(detector, header, value):
                     issues.append(
-                        f"{file_path.name}:{worksheet.title}:{cell.coordinate}: "
+                        f"{workbook_name}:{worksheet_name}:{cell.coordinate}: "
                         "configured sensitive value remains"
                     )
                     continue
@@ -233,17 +272,18 @@ def _validate_xlsx(
                     if _is_safe_generated_value(detection.value):
                         continue
                     issues.append(
-                        f"{file_path.name}:{worksheet.title}:{cell.coordinate}: "
-                        f"{detection.label} remains: {detection.value}"
+                        f"{workbook_name}:{worksheet_name}:{cell.coordinate}: "
+                        f"{_validation_issue_label(detection)} remains"
                     )
 
 
 def _validate_text_file(file_path: Path, detector: Detector, issues: list[str]) -> None:
+    file_name = _validation_location(file_path.name, detector)
     text = file_path.read_text(encoding="utf-8", errors="ignore")
     for detection in detector.detect_text(text):
         if _is_safe_generated_value(detection.value):
             continue
-        issues.append(f"{file_path.name}: {detection.label} remains: {detection.value}")
+        issues.append(f"{file_name}: {_validation_issue_label(detection)} remains")
 
 
 def _formula_is_in_sensitive_column(detector: Detector, header: str) -> bool:
@@ -277,6 +317,7 @@ def _unsupported_ooxml_part_names(file_path: Path) -> list[str]:
         for name in workbook_zip.namelist():
             if name.startswith(
                 (
+                    "xl/chartsheets/",
                     "xl/media/",
                     "xl/drawings/",
                     "xl/charts/",
@@ -299,36 +340,39 @@ def _validate_path(
     issues: list[str],
 ) -> None:
     relative = file_path.relative_to(sanitized_dir).as_posix()
+    redacted_relative = _validation_location(relative, detector)
     for detection in detector.detect_path(relative):
-        issues.append(f"{relative}: path contains {detection.label}: {detection.value}")
+        issues.append(f"{redacted_relative}: path contains {_validation_issue_label(detection)}")
 
 
-def _validate_csv_formulas(file_path: Path, issues: list[str]) -> None:
+def _validate_csv_formulas(file_path: Path, detector: Detector, issues: list[str]) -> None:
+    file_name = _validation_location(file_path.name, detector)
     with file_path.open(newline="", encoding="utf-8-sig") as handle:
         for row_index, row in enumerate(csv.reader(handle), start=1):
             for column_index, value in enumerate(row, start=1):
                 if _looks_like_csv_formula(value):
                     issues.append(
-                        f"{file_path.name}: row {row_index} column {column_index} contains CSV formula"
+                        f"{file_name}: row {row_index} column {column_index} contains CSV formula"
                     )
 
 
 def _validate_csv_values(file_path: Path, detector: Detector, issues: list[str]) -> None:
+    file_name = _validation_location(file_path.name, detector)
     with file_path.open(newline="", encoding="utf-8-sig") as handle:
         rows = list(csv.reader(handle))
     headers = rows[0] if rows else []
     for row_index, row in enumerate(rows, start=1):
         if row_index > 1 and len(row) > len(headers):
-            issues.append(f"{file_path.name}: row {row_index} contains extra columns")
+            issues.append(f"{file_name}: row {row_index} contains extra columns")
         for column_index, value in enumerate(row, start=1):
             header = headers[column_index - 1] if row_index > 1 and column_index <= len(headers) else ""
             if row_index == 1 and _csv_header_is_sensitive(detector, value):
                 issues.append(
-                    f"{file_path.name}: row 1 column {column_index} contains sensitive header"
+                    f"{file_name}: row 1 column {column_index} contains sensitive header"
                 )
             if row_index > 1 and _value_violates_config_sensitive(detector, header, value):
                 issues.append(
-                    f"{file_path.name}: row {row_index} column {column_index} "
+                    f"{file_name}: row {row_index} column {column_index} "
                     "configured sensitive value remains"
                 )
                 continue
@@ -340,8 +384,8 @@ def _validate_csv_values(file_path: Path, detector: Detector, issues: list[str])
                     if _is_safe_generated_value(detection.value):
                         continue
                     issues.append(
-                        f"{file_path.name}: row {row_index} column {column_index} "
-                        f"{detection.label} remains: {detection.value}"
+                        f"{file_name}: row {row_index} column {column_index} "
+                        f"{_validation_issue_label(detection)} remains"
                     )
                 continue
 
@@ -400,6 +444,32 @@ def _is_safe_generated_value(value: str) -> bool:
     )
 
 
+def _validation_issue_label(detection: Detection) -> str:
+    return detection.label
+
+
+def _validation_location(value: str, detector: Detector) -> str:
+    if "/" in value:
+        return "/".join(_validation_location(part, detector) for part in value.split("/"))
+    detections = [
+        detection
+        for detection in detector.detect_path(value)
+        if not _is_safe_generated_value(detection.value)
+    ]
+    if not detections:
+        return value
+    chunks: list[str] = []
+    cursor = 0
+    for detection in sorted(detections, key=lambda item: (item.start, item.end)):
+        if detection.start < cursor:
+            continue
+        chunks.append(value[cursor : detection.start])
+        chunks.append(f"[{_validation_issue_label(detection)}]")
+        cursor = detection.end
+    chunks.append(value[cursor:])
+    return "".join(chunks)
+
+
 def _document_property_values(workbook: Any) -> dict[str, str]:
     properties = workbook.properties
     values: dict[str, str] = {}
@@ -452,3 +522,12 @@ def _worksheet_header_footer_values(worksheet: Any) -> dict[str, str]:
             if isinstance(text, str) and text:
                 values[f"{container_name}.{section_name}"] = text
     return values
+
+
+def _auto_filter_text(worksheet: Any) -> str:
+    auto_filter = worksheet.auto_filter
+    parts: list[str] = []
+    if isinstance(auto_filter.ref, str):
+        parts.append(auto_filter.ref)
+    parts.extend(str(filter_column) for filter_column in auto_filter.filterColumn)
+    return " ".join(parts)

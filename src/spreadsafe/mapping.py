@@ -39,6 +39,8 @@ class PseudonymMapper:
         if multiplier_basis == 100:
             multiplier_basis = 101
         perturbed = round(numeric * (multiplier_basis / 100), 2)
+        if perturbed == 0:
+            return 0.01 if numeric > 0 else -0.01
         if perturbed == numeric:
             perturbed = round(numeric + (0.01 if numeric > 0 else -0.01), 2)
         return perturbed

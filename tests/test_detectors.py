@@ -73,7 +73,37 @@ def test_presidio_locale_failure_does_not_disable_other_locales(
 
     assert labels(results) == {"PERSON"}
     assert calls == ["pl", "en", "en"]
-    assert Detector._presidio_failed_locales == {"pl"}
+    assert Detector._presidio_failed_locales == set()
+
+
+def test_transient_presidio_failure_does_not_disable_locale(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+
+    class StubResult:
+        entity_type = "PERSON"
+        start = 0
+        end = 10
+        score = 0.85
+
+    class StubAnalyzer:
+        def analyze(self, **kwargs: object) -> list[object]:
+            language = str(kwargs["language"])
+            calls.append(language)
+            if calls == ["pl"]:
+                raise RuntimeError("temporary analyzer failure")
+            if language == "pl":
+                return [StubResult()]
+            return []
+
+    monkeypatch.setattr(Detector, "_presidio_analyzer", StubAnalyzer())
+    monkeypatch.setattr(Detector, "_presidio_failed", False)
+    monkeypatch.setattr(Detector, "_presidio_failed_locales", set())
+
+    assert Detector(Config(locale="pl")).detect_text("Jan Kowalski") == []
+    assert labels(Detector(Config(locale="pl")).detect_text("Jan Kowalski")) == {"PERSON"}
+    assert calls == ["pl", "en", "pl"]
 
 
 def test_path_detection_uses_filename_stems_for_presidio() -> None:

@@ -12,6 +12,7 @@ import zipfile
 
 from openpyxl.cell.cell import MergedCell
 from openpyxl import load_workbook
+from openpyxl.worksheet.filters import AutoFilter
 
 from spreadsafe.detectors import Config, Decision, Detection, Detector
 from spreadsafe.mapping import PseudonymMapper
@@ -54,6 +55,7 @@ class Sanitizer:
         with TemporaryDirectory(dir=destination.parent) as temporary:
             temporary_destination = Path(temporary) / destination.name
             shutil.copy2(source, temporary_destination)
+            removed_unsupported_parts = _remove_unsupported_ooxml_parts(temporary_destination)
             workbook = load_workbook(temporary_destination, data_only=False, keep_links=False)
             _clear_document_properties(workbook)
             if _clear_custom_document_properties(workbook):
@@ -67,6 +69,8 @@ class Sanitizer:
                     worksheet.title = self.mapper.token("SHEET", worksheet.title)
                 if _clear_worksheet_headers_footers(worksheet):
                     self.risks.append(f"{source.name}:{worksheet.title}: print headers and footers removed")
+                if _clear_auto_filter(worksheet):
+                    self.risks.append(f"{source.name}:{worksheet.title}: auto filter removed")
                 headers = [str(cell.value or f"Column {cell.column}") for cell in worksheet[1]]
                 for cell in worksheet[1]:
                     if isinstance(cell.value, str):
@@ -101,9 +105,10 @@ class Sanitizer:
                             self.risks.append(f"{source.name}:{worksheet.title}:{cell.coordinate}: hyperlink removed")
                             cell.hyperlink = None
             workbook.save(temporary_destination)
+            _normalize_core_property_timestamps(temporary_destination)
             if _remove_external_link_parts(temporary_destination):
                 self.risks.append(f"{source.name}: external workbook link metadata removed")
-            if _remove_unsupported_ooxml_parts(temporary_destination):
+            if _remove_unsupported_ooxml_parts(temporary_destination) or removed_unsupported_parts:
                 self.risks.append("Unsupported embedded workbook payloads were removed")
             temporary_destination.replace(destination)
 
@@ -436,6 +441,13 @@ def _clear_worksheet_headers_footers(worksheet: Any) -> bool:
     return removed
 
 
+def _clear_auto_filter(worksheet: Any) -> bool:
+    if not worksheet.auto_filter.ref and not worksheet.auto_filter.filterColumn:
+        return False
+    worksheet.auto_filter = AutoFilter()
+    return True
+
+
 def _clear_custom_document_properties(workbook: Any) -> bool:
     custom_properties = getattr(workbook, "custom_doc_props", None)
     properties = getattr(custom_properties, "props", None)
@@ -449,6 +461,8 @@ def _clear_document_properties(workbook: Any) -> None:
     properties = workbook.properties
     properties.creator = "spreadsafe"
     properties.lastModifiedBy = "spreadsafe"
+    properties.created = datetime(2000, 1, 1)
+    properties.modified = datetime(2000, 1, 1)
     for field_name in (
         "title",
         "subject",
@@ -463,6 +477,32 @@ def _clear_document_properties(workbook: Any) -> None:
     ):
         if hasattr(properties, field_name):
             setattr(properties, field_name, None)
+
+
+def _normalize_core_property_timestamps(path: Path) -> None:
+    entries = []
+    changed = False
+    with zipfile.ZipFile(path, "r") as source:
+        for info in source.infolist():
+            data = source.read(info.filename)
+            if info.filename == "docProps/core.xml":
+                for tag in (b"created", b"modified"):
+                    cleaned = re.sub(
+                        rb"(<dcterms:" + tag + rb"\b[^>]*>)[^<]*(</dcterms:" + tag + rb">)",
+                        rb"\g<1>2000-01-01T00:00:00Z\2",
+                        data,
+                    )
+                    changed = changed or cleaned != data
+                    data = cleaned
+            entries.append((info, data))
+    if not changed:
+        return
+    with TemporaryDirectory() as temporary:
+        temporary_path = Path(temporary) / path.name
+        with zipfile.ZipFile(temporary_path, "w") as destination:
+            for info, data in entries:
+                destination.writestr(info, data)
+        shutil.move(temporary_path, path)
 
 
 def _remove_external_link_parts(path: Path) -> bool:
@@ -506,6 +546,7 @@ def _remove_external_link_parts(path: Path) -> bool:
 def _remove_unsupported_ooxml_parts(path: Path) -> bool:
     removed = False
     with zipfile.ZipFile(path, "r") as source:
+        unsupported_workbook_rel_ids = _unsupported_workbook_relationship_ids(source)
         entries: list[tuple[zipfile.ZipInfo, bytes]] = []
         for info in source.infolist():
             if _is_unsupported_ooxml_part(info.filename):
@@ -515,14 +556,18 @@ def _remove_unsupported_ooxml_parts(path: Path) -> bool:
             if info.filename.endswith(".rels"):
                 cleaned = re.sub(
                     rb"<Relationship\b(?=[^>]*(?:/drawing|/image|/oleObject|/package|"
-                    rb"/printerSettings|customXml|media/|embeddings/|charts/|"
+                    rb"/printerSettings|customXml|media/|embeddings/|charts/|chartsheets/|"
                     rb"/chart|/table|tables/|pivotCache|pivotTables?/))[^>]*/>",
                     b"",
                     data,
                 )
                 removed = removed or cleaned != data
                 data = cleaned
-            cleaned = _remove_unsupported_ooxml_references(info.filename, data)
+            cleaned = _remove_unsupported_ooxml_references(
+                info.filename,
+                data,
+                unsupported_workbook_rel_ids,
+            )
             removed = removed or cleaned != data
             data = cleaned
             entries.append((info, data))
@@ -540,6 +585,7 @@ def _remove_unsupported_ooxml_parts(path: Path) -> bool:
 def _is_unsupported_ooxml_part(name: str) -> bool:
     return name.startswith(
         (
+            "xl/chartsheets/",
             "xl/media/",
             "xl/drawings/",
             "xl/charts/",
@@ -553,15 +599,39 @@ def _is_unsupported_ooxml_part(name: str) -> bool:
     )
 
 
-def _remove_unsupported_ooxml_references(name: str, data: bytes) -> bytes:
+def _unsupported_workbook_relationship_ids(source: zipfile.ZipFile) -> set[bytes]:
+    rels_name = "xl/_rels/workbook.xml.rels"
+    if rels_name not in source.namelist():
+        return set()
+    rels = source.read(rels_name)
+    return {
+        match.group(1)
+        for match in re.finditer(
+            rb"<Relationship\b(?=[^>]*relationships/chartsheet)[^>]*\bId=\"([^\"]+)\"[^>]*/>",
+            rels,
+        )
+    }
+
+
+def _remove_unsupported_ooxml_references(
+    name: str,
+    data: bytes,
+    unsupported_workbook_rel_ids: set[bytes],
+) -> bytes:
     if name == "[Content_Types].xml":
         return re.sub(
-            rb"<Override\b(?=[^>]*PartName=\"/(?:xl/(?:media|drawings|charts|embeddings|"
+            rb"<Override\b(?=[^>]*PartName=\"/(?:xl/(?:chartsheets|media|drawings|charts|embeddings|"
             rb"pivotCache|pivotTables|printerSettings|tables)/|customXml/))[^>]*/>",
             b"",
             data,
         )
     if name == "xl/workbook.xml":
+        for rel_id in unsupported_workbook_rel_ids:
+            data = re.sub(
+                rb"<sheet\b(?=[^>]*\br:id=\"" + re.escape(rel_id) + rb"\")[^>]*/>",
+                b"",
+                data,
+            )
         return re.sub(
             rb"<pivotCaches\b[^>]*>.*?</pivotCaches>",
             b"",
