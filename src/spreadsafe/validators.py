@@ -22,7 +22,13 @@ from spreadsafe.sanitizer import (
     _parse_iso_date,
 )
 
-ALLOWED_PACKAGE_ROOT_ENTRIES = {".gitignore", ".spreadsafe-package", "reports", "sanitized"}
+ALLOWED_PACKAGE_ROOT_ENTRIES = {
+    ".gitignore",
+    ".spreadsafe-package",
+    ".spreadsafe-reports",
+    "reports",
+    "sanitized",
+}
 SAFE_DOCUMENT_TIMESTAMP = datetime(2000, 1, 1)
 
 
@@ -116,6 +122,11 @@ def _validate_package_root(output_dir: Path, detector: Detector, issues: list[st
                 issues.append(f"Package marker is not a file: {child_location}")
             elif child.read_text(encoding="utf-8", errors="ignore") != "spreadsafe\n":
                 issues.append(f"Package marker content is invalid: {child_location}")
+        elif child.name == ".spreadsafe-reports":
+            if not child.is_file():
+                issues.append(f"Reports marker is not a file: {child_location}")
+            elif child.read_text(encoding="utf-8", errors="ignore") != "spreadsafe-reports\n":
+                issues.append(f"Reports marker content is invalid: {child_location}")
         elif child.name == "reports" and not child.is_dir():
             issues.append(f"Package reports path is not a directory: {child_location}")
 

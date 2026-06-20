@@ -23,12 +23,33 @@ from spreadsafe.validators import (
 
 def scan(input_dir: Path, out: Path) -> int:
     try:
-        result = package_directory(input_dir, out)
+        _ensure_input_directory(input_dir)
+        _ensure_input_output_do_not_overlap(input_dir, out)
+        config = load_config(input_dir / "spreadsafe.yml")
+        sanitizer = Sanitizer(config, PseudonymMapper(seed=str(input_dir.resolve())))
+        with _temporary_output(out) as staged_name:
+            staged_out = Path(staged_name)
+            sanitized_dir = staged_out / "sanitized"
+            reports_dir = staged_out / "reports"
+            sanitized_dir.mkdir(parents=True, exist_ok=True)
+            reports_dir.mkdir(parents=True, exist_ok=True)
+            sanitizer.sanitize_directory(input_dir, sanitized_dir)
+            reports = scan_directory(
+                sanitized_dir,
+                max_sample_rows_per_sheet=config.max_sample_rows_per_sheet,
+            )
+            write_reports(reports, sanitizer.risks, reports_dir, config)
+            (staged_out / ".spreadsafe-reports").write_text("spreadsafe-reports\n", encoding="utf-8")
+            _remove_path(sanitized_dir)
+            _replace_generated_output(
+                staged_out,
+                out,
+                ("sanitized", "reports", ".spreadsafe-package", ".spreadsafe-reports"),
+                config=config,
+            )
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
-    if _exit_if_validation_failed(result):
-        return 1
     print(f"Wrote reports to {out / 'reports'}")
     return 0
 
@@ -48,7 +69,11 @@ def sanitize(input_dir: Path, out: Path) -> int:
             (staged_out / ".spreadsafe-package").write_text("spreadsafe\n", encoding="utf-8")
             result = validate_output(staged_out, config)
             if result.passed:
-                _replace_generated_output(staged_out, out, ("sanitized", "reports", ".spreadsafe-package"))
+                _replace_generated_output(
+                    staged_out,
+                    out,
+                    ("sanitized", "reports", ".spreadsafe-package", ".spreadsafe-reports"),
+                )
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
@@ -109,7 +134,7 @@ def package_directory(input_dir: Path, output_dir: Path) -> ValidationResult:
             _replace_generated_output(
                 staged_output,
                 output_dir,
-                ("sanitized", "reports", ".spreadsafe-package"),
+                ("sanitized", "reports", ".spreadsafe-package", ".spreadsafe-reports"),
             )
         return result
 
@@ -147,8 +172,10 @@ def _replace_generated_output(
     staged_output: Path,
     output_dir: Path,
     child_names: tuple[str, ...],
+    *,
+    config: Config | None = None,
 ) -> None:
-    _ensure_output_is_owned_or_empty(output_dir)
+    _ensure_output_is_owned_or_empty(output_dir, config)
     output_dir.mkdir(parents=True, exist_ok=True)
     backups: list[tuple[Path, Path]] = []
     installed: list[Path] = []
@@ -211,9 +238,17 @@ def _ensure_managed_output_child_is_safe(path: Path) -> None:
             raise ValueError("Existing output package marker is not a file")
         if path.read_text(encoding="utf-8", errors="ignore") != "spreadsafe\n":
             raise ValueError("Existing output package marker content is invalid")
+    if path.name == ".spreadsafe-reports":
+        if not path.is_file():
+            raise ValueError("Existing output reports marker is not a file")
+        if path.read_text(encoding="utf-8", errors="ignore") != "spreadsafe-reports\n":
+            raise ValueError("Existing output reports marker content is invalid")
 
 
-def _ensure_output_is_owned_or_empty(output_dir: Path, config: Config | None = None) -> None:
+def _ensure_output_is_owned_or_empty(
+    output_dir: Path,
+    config: Config | None = None,
+) -> None:
     if not output_dir.exists():
         return
     if output_dir.is_symlink():
@@ -228,6 +263,14 @@ def _ensure_output_is_owned_or_empty(output_dir: Path, config: Config | None = N
             raise ValueError("Existing output package marker is not a file")
         if marker.read_text(encoding="utf-8", errors="ignore") != "spreadsafe\n":
             raise ValueError("Existing output package marker content is invalid")
+    reports_marker = output_dir / ".spreadsafe-reports"
+    has_reports_marker = False
+    if reports_marker.exists():
+        if not reports_marker.is_file():
+            raise ValueError("Existing output reports marker is not a file")
+        if reports_marker.read_text(encoding="utf-8", errors="ignore") != "spreadsafe-reports\n":
+            raise ValueError("Existing output reports marker content is invalid")
+        has_reports_marker = True
     for child in output_dir.iterdir():
         if child.name not in ALLOWED_PACKAGE_ROOT_ENTRIES:
             raise ValueError(f"Refusing to use existing output directory containing unmanaged files: {output_dir}")
@@ -251,10 +294,27 @@ def _ensure_output_is_owned_or_empty(output_dir: Path, config: Config | None = N
             for nested in child.rglob("*"):
                 if nested.is_symlink():
                     raise ValueError(f"Cannot prepare output directory because {nested} is a symlink")
-        if not marker.exists() and child.exists() and any(child.iterdir()):
+        if (
+            not marker.exists()
+            and child.exists()
+            and any(child.iterdir())
+            and (
+                child.name != "reports"
+                or not has_reports_marker
+                or not _is_generated_reports_dir(child)
+            )
+        ):
             raise ValueError(
                 f"Refusing to clear existing output directory without spreadsafe marker: {output_dir}"
             )
+
+
+def _is_generated_reports_dir(path: Path) -> bool:
+    report_names = {"workbook-report.md", "workbook-report.json", "risk-report.md"}
+    children = list(path.iterdir())
+    return {child.name for child in children} == report_names and all(
+        child.is_file() for child in children
+    )
 
 
 def _build_parser() -> ArgumentParser:

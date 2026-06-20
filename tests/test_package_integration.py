@@ -172,6 +172,50 @@ def test_cli_help_lists_commands() -> None:
         assert command in result.stdout
 
 
+def test_scan_command_writes_reports_without_package_outputs(tmp_path: Path) -> None:
+    input_dir = tmp_path / "input"
+    output_dir = tmp_path / "scan-output"
+    input_dir.mkdir()
+    make_workbook(input_dir / "orders.xlsx")
+
+    result = invoke_cli(["scan", str(input_dir), "--out", str(output_dir)])
+
+    assert result.exit_code == 0
+    assert (output_dir / "reports" / "workbook-report.md").exists()
+    assert not (output_dir / "sanitized").exists()
+    assert not (output_dir / ".spreadsafe-package").exists()
+
+
+def test_scan_command_removes_stale_package_outputs(tmp_path: Path) -> None:
+    input_dir = tmp_path / "input"
+    output_dir = tmp_path / "codex-safe"
+    input_dir.mkdir()
+    make_workbook(input_dir / "orders.xlsx")
+    assert invoke_cli(["package", str(input_dir), "--out", str(output_dir)]).exit_code == 0
+
+    result = invoke_cli(["scan", str(input_dir), "--out", str(output_dir)])
+
+    assert result.exit_code == 0
+    assert (output_dir / "reports" / "workbook-report.md").exists()
+    assert not (output_dir / "sanitized").exists()
+    assert not (output_dir / ".spreadsafe-package").exists()
+
+
+def test_scan_command_rejects_sensitive_existing_output_gitignore(tmp_path: Path) -> None:
+    input_dir = tmp_path / "input"
+    output_dir = tmp_path / "scan-output"
+    input_dir.mkdir()
+    output_dir.mkdir()
+    make_workbook(input_dir / "orders.xlsx")
+    (output_dir / ".gitignore").write_text("jan@example.com\n", encoding="utf-8")
+
+    result = invoke_cli(["scan", str(input_dir), "--out", str(output_dir)])
+
+    assert result.exit_code == 2
+    assert "Existing output .gitignore contains sensitive data" in result.stderr
+    assert (output_dir / ".gitignore").read_text(encoding="utf-8") == "jan@example.com\n"
+
+
 def test_validate_command_applies_config_file(tmp_path: Path) -> None:
     output_dir = tmp_path / "codex-safe"
     sanitized_dir = output_dir / "sanitized"
@@ -1090,7 +1134,7 @@ def test_scan_and_sanitize_clear_stale_sibling_outputs(tmp_path: Path) -> None:
 
     assert second_scan_result.exit_code == 0
     assert (output_dir / "reports" / "workbook-report.md").exists()
-    assert (output_dir / "sanitized" / "orders.xlsx").exists()
+    assert not (output_dir / "sanitized").exists()
 
 
 def test_sanitize_command_rejects_unmarked_stale_sanitized_files(tmp_path: Path) -> None:
@@ -1261,21 +1305,56 @@ def test_scan_command_rejects_invalid_paths_without_traceback(tmp_path: Path) ->
     assert "Traceback" not in nested_result.stderr
 
 
-def test_scan_command_clears_stale_reports_in_owned_output(tmp_path: Path) -> None:
+def test_scan_command_overwrites_stale_generated_reports(tmp_path: Path) -> None:
     input_dir = tmp_path / "input"
     output_dir = tmp_path / "scan-output"
     input_dir.mkdir()
     make_workbook(input_dir / "orders.xlsx")
     first_result = invoke_cli(["scan", str(input_dir), "--out", str(output_dir)])
-    stale_report = output_dir / "reports" / "old.md"
-    stale_report.write_text("stale report\n", encoding="utf-8")
+    report = output_dir / "reports" / "workbook-report.md"
+    report.write_text("stale report\n", encoding="utf-8")
     second_result = invoke_cli(["scan", str(input_dir), "--out", str(output_dir)])
 
     assert first_result.exit_code == 0
     assert second_result.exit_code == 0
-    assert not stale_report.exists()
-    assert (output_dir / "reports" / "workbook-report.md").exists()
-    assert (output_dir / "sanitized" / "orders.xlsx").exists()
+    assert "stale report" not in report.read_text(encoding="utf-8")
+    assert not (output_dir / "sanitized").exists()
+
+
+def test_scan_command_rejects_unmarked_generated_report_names(tmp_path: Path) -> None:
+    input_dir = tmp_path / "input"
+    output_dir = tmp_path / "scan-output"
+    reports_dir = output_dir / "reports"
+    input_dir.mkdir()
+    reports_dir.mkdir(parents=True)
+    make_workbook(input_dir / "orders.xlsx")
+    for name in ("workbook-report.md", "workbook-report.json", "risk-report.md"):
+        (reports_dir / name).write_text("user report\n", encoding="utf-8")
+
+    result = invoke_cli(["scan", str(input_dir), "--out", str(output_dir)])
+
+    assert result.exit_code == 2
+    assert "Refusing to clear existing output directory" in result.stderr
+    assert (reports_dir / "workbook-report.md").read_text(encoding="utf-8") == "user report\n"
+
+
+def test_scan_command_rejects_unmarked_reports_with_extra_files(tmp_path: Path) -> None:
+    input_dir = tmp_path / "input"
+    output_dir = tmp_path / "scan-output"
+    reports_dir = output_dir / "reports"
+    input_dir.mkdir()
+    reports_dir.mkdir(parents=True)
+    make_workbook(input_dir / "orders.xlsx")
+    for name in ("workbook-report.md", "workbook-report.json", "risk-report.md"):
+        (reports_dir / name).write_text("generated\n", encoding="utf-8")
+    extra_report = reports_dir / "notes.txt"
+    extra_report.write_text("user notes\n", encoding="utf-8")
+
+    result = invoke_cli(["scan", str(input_dir), "--out", str(output_dir)])
+
+    assert result.exit_code == 2
+    assert "Refusing to clear existing output directory" in result.stderr
+    assert extra_report.read_text(encoding="utf-8") == "user notes\n"
 
 
 def test_package_command_rejects_scalar_config_lists_without_traceback(tmp_path: Path) -> None:
@@ -1566,6 +1645,32 @@ def test_validate_checks_preserved_package_gitignore(tmp_path: Path) -> None:
     assert any(".gitignore: EMAIL remains" in issue for issue in result.issues)
 
 
+def test_validate_rejects_invalid_reports_marker(tmp_path: Path) -> None:
+    output_dir = tmp_path / "codex-safe"
+    sanitized_dir = output_dir / "sanitized"
+    sanitized_dir.mkdir(parents=True)
+    (sanitized_dir / "safe.csv").write_text("status\nACTIVE\n", encoding="utf-8")
+    (output_dir / ".spreadsafe-reports").mkdir()
+
+    result = validate_output(output_dir)
+
+    assert not result.passed
+    assert any("Reports marker is not a file" in issue for issue in result.issues)
+
+
+def test_validate_rejects_bad_reports_marker_content(tmp_path: Path) -> None:
+    output_dir = tmp_path / "codex-safe"
+    sanitized_dir = output_dir / "sanitized"
+    sanitized_dir.mkdir(parents=True)
+    (sanitized_dir / "safe.csv").write_text("status\nACTIVE\n", encoding="utf-8")
+    (output_dir / ".spreadsafe-reports").write_text("not spreadsafe\n", encoding="utf-8")
+
+    result = validate_output(output_dir)
+
+    assert not result.passed
+    assert any("Reports marker content is invalid" in issue for issue in result.issues)
+
+
 def test_package_rejects_file_where_generated_directory_is_expected(tmp_path: Path) -> None:
     input_dir = tmp_path / "input"
     output_dir = tmp_path / "codex-safe"
@@ -1592,6 +1697,20 @@ def test_package_does_not_delete_unmarked_existing_output_directories(tmp_path: 
         package_directory(input_dir, output_dir)
 
     assert sentinel.exists()
+
+
+def test_package_rejects_unmarked_generated_report_names(tmp_path: Path) -> None:
+    input_dir = tmp_path / "input"
+    output_dir = tmp_path / "existing"
+    reports_dir = output_dir / "reports"
+    input_dir.mkdir()
+    reports_dir.mkdir(parents=True)
+    make_workbook(input_dir / "orders.xlsx")
+    for name in ("workbook-report.md", "workbook-report.json", "risk-report.md"):
+        (reports_dir / name).write_text("user-owned\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="Refusing to clear existing output directory"):
+        package_directory(input_dir, output_dir)
 
 
 def test_package_rejects_unmanaged_root_files_in_output_directory(tmp_path: Path) -> None:

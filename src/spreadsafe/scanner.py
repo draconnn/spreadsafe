@@ -82,7 +82,7 @@ def scan_xlsx(
     workbook = load_workbook(path, data_only=False)
     detector = Detector(load_config(None))
     warnings: list[str] = []
-    if workbook.security.lockStructure:
+    if workbook.security is not None and workbook.security.lockStructure:
         warnings.append("Workbook structure is locked")
     sheets: list[SheetReport] = []
     for worksheet in workbook.worksheets:
